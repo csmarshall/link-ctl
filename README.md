@@ -1,6 +1,22 @@
 # link-ctl
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-csmarshall-yellow?logo=buy-me-a-coffee)](https://buymeacoffee.com/cs_marshall)
+[![Support the EFF](https://img.shields.io/badge/Support-EFF-blue?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0xMiAyQzYuNDggMiAyIDYuNDggMiAxMnM0LjQ4IDEwIDEwIDEwIDEwLTQuNDggMTAtMTBTMTcuNTIgMiAxMiAyem0xIDE1aC0ydi02aDJ2NnptMC04aC0yVjdoMnYyeiIvPjwvc3ZnPg==)](https://supporters.eff.org/donate/donate-eff-4)
+
+## Why this exists
+
+The Insta360 Link (original) is a great webcam. The Link Controller desktop app is fine.
+But when Insta360 added first-party Stream Deck plugin support, it was [only for the Link 2](https://www.reddit.com/r/Insta360/comments/1rmmpxh/og_insta360_link_doesnt_get_streamdeck_support/) —
+leaving original Link owners with a suggestion to use global hotkeys instead.
+
+That's a reasonable workaround, but it felt like a miss for people who had invested in the
+original hardware. The Link Controller app already exposes a local WebSocket API for its
+mobile remote — all the capability was there. This tool uses it.
+
+If you have an OG Link and want proper automation, Stream Deck support, or scripting,
+this is for you. Connecting software you own to hardware you own is [something worth protecting](https://www.eff.org/deeplinks/2019/10/adversarial-interoperability).
+
+---
 
 CLI tool to control an **Insta360 Link** (original, not Link 2) webcam by
 communicating with the **Insta360 Link Controller** desktop app via its local
