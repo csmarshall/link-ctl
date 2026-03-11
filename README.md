@@ -741,9 +741,20 @@ Some paramTypes trigger cascades on the server side:
 
 ### Version bumping
 
-The patch version in `pyproject.toml` is bumped automatically on every commit
-via a git pre-commit hook. Activate it once after cloning:
+When `link_ctl.py` is staged, two hooks fire automatically:
 
+1. **`pre-commit`** — bumps the patch version in `pyproject.toml` and stages it
+2. **`prepare-commit-msg`** — prepends `v{version} — ` to your commit message
+
+So you just write the description:
+```bash
+git commit -m "add brightness command"
+# → commit message becomes: "v1.0.5 — add brightness command"
+```
+
+Doc-only commits (README, API.md, workflows, etc.) leave the version unchanged.
+
+Activate once after cloning:
 ```bash
 git config core.hooksPath .githooks
 ```

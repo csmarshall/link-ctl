@@ -1,0 +1,12 @@
+#!/bin/sh
+# When link_ctl.py is staged, prepend the new version to the commit message.
+# The pre-commit hook has already bumped pyproject.toml by the time this runs.
+# Usage: just write the description — "add brightness command"
+# Result: "v1.0.5 — add brightness command"
+
+if git diff --cached --name-only | grep -q "^link_ctl\.py$"; then
+    MSG_FILE="$1"
+    VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+    CURRENT=$(cat "$MSG_FILE")
+    printf "v%s — %s" "$VERSION" "$CURRENT" > "$MSG_FILE"
+fi
