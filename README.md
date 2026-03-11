@@ -21,6 +21,33 @@ this is for you. Connecting software you own to hardware you own is [something w
 
 ---
 
+## Table of Contents
+
+- [Feature Matrix](#feature-matrix)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Commands](#commands)
+  - [PTZ Control](#ptz-control)
+  - [Privacy](#privacy)
+  - [AI Modes](#ai-modes-macoswindows-only)
+  - [Image Settings](#image-settings-macoswindows-only)
+  - [Presets](#presets)
+  - [Diagnostics](#diagnostics)
+  - [Global Flags](#global-flags)
+- [Preflight Checks](#preflight-checks)
+- [Port Discovery](#port-discovery)
+- [State Cache](#state-cache)
+- [Exit Codes](#exit-codes)
+- [Stream Deck Setup](#stream-deck-setup)
+- [Linux](#linux)
+- [Protocol Notes](#protocol-notes)
+- [Testing & Validation](#testing--validation)
+- [Reverse Engineering the API](#reverse-engineering-the-api)
+- [Development](#development)
+
+---
+
 CLI tool to control an **Insta360 Link** (original) webcam by communicating
 with the **Insta360 Link Controller** desktop app via its local WebSocket server.
 
@@ -40,23 +67,33 @@ minimize it or disable the preview; the WebSocket server stays active.
 
 Legend: ✅ confirmed + validated · ⚠️ confirmed sent, limited/no readback · ❌ not supported
 
+**PTZ**
+
 | UI Feature | CLI Command | paramType | validate.py | Notes |
 |---|---|---|---|---|
-| **── PTZ ──** |||||
 | Zoom | `zoom N` / `zoom-rel ±N` | 4 | ✅ zoom | 100–400 |
 | Pan | `pan-rel N` | 6/7 | — | Velocity pulse; no absolute positioning |
 | Tilt | `tilt-rel N` | 6/7 | — | Velocity pulse |
 | Center/reset | `center` | 3 | — | Resets pan, tilt, and zoom |
 | Privacy | `privacy on\|off\|toggle` | 6/7 | — | Tilt to bottom stop (3.5 s pulse) |
-| **── AI Modes ──** |||||
+| Absolute pan/tilt | — | — | — | ❌ v2.2.1 is velocity-only; exits with code 4 |
+
+**AI Modes**
+
+| UI Feature | CLI Command | paramType | validate.py | Notes |
+|---|---|---|---|---|
 | Normal | `normal` | 5 | — | Clears all AI modes |
 | AI Tracking | `track on\|off\|toggle` | 5 | ✅ track | Smart toggle reads mode field |
 | Overhead | `overhead on\|off\|toggle` | 5 | ✅ overhead | |
 | DeskView | `deskview on\|off\|toggle` | 5 | ✅ deskview | |
 | Whiteboard | `whiteboard on\|off\|toggle` | 5 | ✅ whiteboard | |
-| **── Image Settings ──** |||||
+
+**Image Settings**
+
+| UI Feature | CLI Command | paramType | validate.py | Notes |
+|---|---|---|---|---|
 | HDR | `hdr on\|off\|toggle` | 26 | ✅ hdr | |
-| Auto Focus | `autofocus on\|off` | 18 | — | ✅ Confirmed from tshark capture; no DeviceInfo readback, explicit on/off required |
+| Auto Focus | `autofocus on\|off` | 18 | — | ✅ Confirmed from tshark; no DeviceInfo readback, explicit on/off required |
 | Auto Exposure | `autoexposure on\|off\|toggle` | 17 | ✅ autoexposure | |
 | Exposure Comp | `exposurecomp 0-100` | 16 | ✅ exposurecomp | 50 = 0 EV; only active when AE is off |
 | Auto White Balance | `awb on\|off\|toggle` | 20 | ✅ awb | |
@@ -69,18 +106,23 @@ Legend: ✅ confirmed + validated · ⚠️ confirmed sent, limited/no readback 
 | Horizontal Flip | `mirror on\|off\|toggle` | 2 | — | ⚠️ DeviceInfo mirror field does not update; toggle defaults to on |
 | Smart Composition | `smartcomposition on\|off\|toggle` | 11 | — | ✅ Confirmed from capture; requires AI tracking on |
 | Smart Comp Frame | `smartcomp-frame head\|halfbody\|wholebody` | 10 | — | ✅ Confirmed from capture |
-| **── Gesture Control ──** |||||
 | Gesture Zoom | `gesture-zoom on\|off\|toggle` | 39 | — | ⚠️ No DeviceInfo readback |
-| **── Presets ──** |||||
+
+**Presets**
+
+| UI Feature | CLI Command | paramType | validate.py | Notes |
+|---|---|---|---|---|
 | Preset recall | `preset 0-19` | — | ⚠️ preset | ✅ Live tested; serial in field 4 (confirmed from capture) |
 | Preset save | `preset-save 0-19` | — | ⚠️ preset-save | ✅ Live tested |
 | Preset delete | `preset-delete 0-19` | — | ⚠️ preset-delete | ✅ Live tested; slot disappears from UI |
-| **── Diagnostics ──** |||||
+
+**Diagnostics**
+
+| UI Feature | CLI Command | paramType | validate.py | Notes |
+|---|---|---|---|---|
 | Status | `status` | — | — | JSON dump of all DeviceInfo fields |
 | Preflight | `preflight` | — | — | Checks process, USB, port, handshake |
 | Port discovery | `discover` | — | — | lsof → priority ports → range scan |
-| **── Not supported ──** |||||
-| Absolute pan/tilt | — | — | — | ❌ v2.2.1 is velocity-only; exits with code 4 |
 
 ### Platform coverage
 
