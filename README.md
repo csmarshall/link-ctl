@@ -134,13 +134,14 @@ Legend: ✅ confirmed + validated · ⚠️ confirmed sent, limited/no readback 
 
 ### Outstanding work
 
-- [ ] **Windows validation** — run `preflight`, `status`, and `validate.py` on a real Windows machine with the camera connected
-- [x] **Anti-flicker** — paramType=27 confirmed; Auto=`"0"`, 50Hz=`"1"`, 60Hz=`"2"` all eyeball-confirmed.
-- [x] **`smartcomposition` + `smartcomp-frame`** — confirmed from tshark capture. paramType=11 (on/off), paramType=10 (head/halfbody/wholebody). Requires AI tracking to be active. UI toggles confirmed visually.
-- [x] **`autofocus` paramType** — paramType=18 confirmed from tshark capture 2026-03-10. No DeviceInfo readback; explicit on/off required.
+- [ ] **Windows validation** ([#2](https://github.com/csmarshall/link-ctl/issues/2)) — run `preflight`, `status`, and `validate.py` on a real Windows machine with the camera connected
+- [ ] **Newer camera compatibility** — unverified on [Link 2](https://github.com/csmarshall/link-ctl/issues/5), [Link 2C](https://github.com/csmarshall/link-ctl/issues/6), [Link 2 Pro](https://github.com/csmarshall/link-ctl/issues/7), [Link 2C Pro](https://github.com/csmarshall/link-ctl/issues/8)
 
 ### Resolved
 
+- [x] **Anti-flicker** — paramType=27 confirmed; Auto=`"0"`, 50Hz=`"1"`, 60Hz=`"2"` all eyeball-confirmed.
+- [x] **`smartcomposition` + `smartcomp-frame`** — confirmed from tshark capture. paramType=11 (on/off), paramType=10 (head/halfbody/wholebody). Requires AI tracking to be active.
+- [x] **`autofocus` paramType** — paramType=18 confirmed from tshark capture. No DeviceInfo readback; explicit on/off required.
 - [x] **Exposure compensation range** — paramType=16 confirmed, value 0–100, validated in `validate.py`.
 - [x] **`preset-save`/`preset`/`preset-delete`** — live tested: save moves camera to position, recall returns to it, delete removes slot from UI. Wire format confirmed from tshark capture — serial is in field 4 (not field 3 as the proto schema suggested).
 - [x] **Mirror/flip readback** — `DeviceInfo.mirror` does not update when paramType=2 is sent. Accepted limitation; `toggle` defaults to `on` when state is unknown. Documented in API.md.
