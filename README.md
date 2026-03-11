@@ -1,5 +1,8 @@
 # link-ctl
 
+[![PyPI version](https://img.shields.io/pypi/v/link-ctl.svg)](https://pypi.org/project/link-ctl/)
+[![Python](https://img.shields.io/pypi/pyversions/link-ctl.svg)](https://pypi.org/project/link-ctl/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-csmarshall-yellow?logo=buy-me-a-coffee)](https://buymeacoffee.com/cs_marshall)
 [![Support the EFF](https://img.shields.io/badge/Support-EFF-blue?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0xMiAyQzYuNDggMiAyIDYuNDggMiAxMnM0LjQ4IDEwIDEwIDEwIDEwLTQuNDggMTAtMTBTMTcuNTIgMiAxMiAyem0xIDE1aC0ydi02aDJ2NnptMC04aC0yVjdoMnYyeiIvPjwvc3ZnPg==)](https://supporters.eff.org/donate/donate-eff-4)
 
@@ -115,13 +118,13 @@ Legend: ✅ confirmed + validated · ⚠️ confirmed sent, limited/no readback 
 
 ```bash
 # Recommended — isolated install, link-ctl appears on PATH automatically
+pipx install link-ctl
+
+# Or from GitHub
 pipx install git+https://github.com/csmarshall/link-ctl
 
-# Or from a local clone
-pipx install .
-
 # Plain pip (into your active venv or system Python)
-pip install git+https://github.com/csmarshall/link-ctl
+pip install link-ctl
 ```
 
 > **No pipx?** `brew install pipx && pipx ensurepath`
