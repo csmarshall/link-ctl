@@ -4,7 +4,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/link-ctl.svg)](https://pypi.org/project/link-ctl/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-csmarshall-yellow?logo=buy-me-a-coffee)](https://buymeacoffee.com/cs_marshall)
-[![Support the EFF](https://img.shields.io/badge/Support-Electronic%20Frontier%20Foundation-blue)](https://supporters.eff.org/donate/donate-eff-4)
+[![Support the EFF](https://img.shields.io/badge/Support%20the%20EFF-donate-blue)](https://supporters.eff.org/donate/donate-eff-4)
 
 ## Why this exists
 
