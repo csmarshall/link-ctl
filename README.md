@@ -21,9 +21,15 @@ this is for you. Connecting software you own to hardware you own is [something w
 
 ---
 
-CLI tool to control an **Insta360 Link** (original, not Link 2) webcam by
-communicating with the **Insta360 Link Controller** desktop app via its local
-WebSocket server.
+CLI tool to control an **Insta360 Link** (original) webcam by communicating
+with the **Insta360 Link Controller** desktop app via its local WebSocket server.
+
+> **Newer models:** Compatibility with the
+> [Link 2](https://github.com/csmarshall/link-ctl/issues/5),
+> [Link 2C](https://github.com/csmarshall/link-ctl/issues/6),
+> [Link 2 Pro](https://github.com/csmarshall/link-ctl/issues/7), and
+> [Link 2C Pro](https://github.com/csmarshall/link-ctl/issues/8)
+> is unverified — if you have one, give it a try and report back!
 
 The Link Controller app must be running — that's expected and fine. You can
 minimize it or disable the preview; the WebSocket server stays active.
