@@ -117,13 +117,14 @@ Legend: ✅ confirmed + validated · ⚠️ confirmed sent, limited/no readback 
 ## Installation
 
 ```bash
-# Recommended — isolated install, link-ctl appears on PATH automatically
+# Homebrew (macOS)
+brew tap csmarshall/link-ctl https://github.com/csmarshall/link-ctl
+brew install link-ctl
+
+# pipx — recommended for Python CLI tools
 pipx install link-ctl
 
-# Or from GitHub
-pipx install git+https://github.com/csmarshall/link-ctl
-
-# Plain pip (into your active venv or system Python)
+# pip
 pip install link-ctl
 ```
 
