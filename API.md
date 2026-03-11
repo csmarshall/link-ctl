@@ -97,6 +97,8 @@ A request always pairs a flag field with the corresponding message field
 
 ```python
 def _encode_varint(v: int) -> bytes:
+    # Handles non-negative integers only. Negative values are not needed for
+    # any command in this protocol; if required, add 2**64 before encoding.
     out = []
     while v > 0x7F:
         out.append((v & 0x7F) | 0x80)
@@ -262,6 +264,7 @@ Sent by the server on connect and after some state changes. Outer field 10 conta
 | 2 | string | serialNum |
 | 4 | varint | mode (0=normal, 1=tracking, 4=overhead, 5=deskview, 6=whiteboard) |
 | 5 | message | ZoomInfo {field1=curValue, field2=minValue, field3=maxValue} |
+| 5 | varint | mirror/horizontal-flip bool — same field number, only present when ZoomInfo is absent; **unreliable**: DeviceInfo does not update after a flip command is sent |
 | 9 | varint | curPresetPos |
 | 10 | message | Image settings sub-message (see below) |
 
@@ -275,8 +278,10 @@ Sent by the server on connect and after some state changes. Outer field 10 conta
 | 14 | saturation (int, 0–100) |
 | 15 | sharpness (int, 0–100) |
 | 17 | autoExposure (bool) |
+| 20 | exposureComp (int, 0–100; default 50 = 0 EV) |
 | 21 | autoWhiteBalance (bool) |
 | 22 | wbTemp (int, Kelvin) |
+| 24 | smartComposition (bool) |
 
 **No autofocus readback exists in DeviceInfo.** The camera never reports autofocus
 state; smart toggle is structurally impossible.

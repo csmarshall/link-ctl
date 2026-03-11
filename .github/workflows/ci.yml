@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # ── Fast checks: syntax, import, CLI smoke ──────────────────────────────────
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install
+        run: pip install .
+
+      - name: Syntax check
+        run: python -m py_compile link_ctl.py validate.py scripts/bump_version.py scripts/update_formula.py
+
+      - name: Import check
+        run: python -c "import link_ctl"
+
+      - name: Help
+        run: link-ctl --help
+
+      - name: Subcommand help
+        run: |
+          for cmd in zoom zoom-rel pan-rel tilt-rel center track deskview whiteboard overhead normal \
+                     hdr autofocus autoexposure awb mirror brightness contrast saturation sharpness \
+                     exposurecomp wb-temp gesture-zoom anti-flicker smartcomposition smartcomp-frame \
+                     preset preset-save preset-delete privacy status discover preflight; do
+            link-ctl "$cmd" --help > /dev/null
+          done
+
+  # ── Homebrew formula install (macOS) ────────────────────────────────────────
+  brew:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install formula from source
+        run: brew install --build-from-source ./Formula/link-ctl.rb
+
+      - name: Run formula test
+        run: brew test ./Formula/link-ctl.rb

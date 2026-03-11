@@ -1,0 +1,6 @@
+#!/bin/sh
+# Auto-bump patch version when link_ctl.py is part of the commit.
+# Install: git config core.hooksPath .githooks
+if git diff --cached --name-only | grep -q "^link_ctl\.py$"; then
+    python3 "$(git rev-parse --show-toplevel)/scripts/bump_version.py"
+fi

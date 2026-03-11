@@ -243,10 +243,17 @@ link-ctl status             # Dump full device info as JSON
 ### Global Flags
 
 ```
---debug           Hex-dump every WebSocket frame sent/received (to stderr)
---port N          Override port discovery; connect to port N directly
---skip-preflight  Skip process/USB/port checks (use cached port)
+-v, --verbose     Show current and new values on each change (default)
+-q, --quiet       Suppress informational output; show errors only
+-s, --silent      Suppress all output including errors (useful for scripts)
+-d, --debug       Hex-dump every WebSocket frame sent/received (to stderr)
+    --port N      Override port discovery; connect to port N directly
+    --skip-preflight  Skip process/USB/port checks (use cached port)
 ```
+
+By default (`--verbose`) every command prints a `current → new` line to stderr
+before applying, e.g. `brightness: 50 → 80`. Use `--quiet` for Stream Deck
+scripts where you only want errors, or `--silent` for fully silent automation.
 
 ---
 
@@ -254,7 +261,7 @@ link-ctl status             # Dump full device info as JSON
 
 Before every command, `link-ctl` validates:
 
-1. **Controller running** — `pgrep "Insta360 Link Controller"` (macOS) / `tasklist` (Windows)
+1. **Controller running** — `pgrep -f "Insta360 Link Controller"` (macOS) / `tasklist` (Windows)
 2. **Camera USB** — `ioreg -p IOUSB` (macOS) or `wmic Win32_PnPEntity` (Windows)
 3. **Port discovery** — cache → lsof → priority scan → range scan
 4. **WebSocket handshake** — connects and exchanges controlRequest/Response
@@ -474,7 +481,7 @@ sudo tshark -i lo0 -Y "websocket" -T fields \
     -E header=y > ~/apitest-capture.txt
 
 # 2. Run the exerciser (press Enter when tshark is running)
-python3 tools/apitest.py
+python3 apitest.py
 
 # 3. Ctrl-C tshark when done, then decode the capture:
 #    correlate timestamps in apitest output with packet hex in the capture
@@ -482,10 +489,10 @@ python3 tools/apitest.py
 
 Flags:
 ```
-python3 tools/apitest.py --port 49924   # explicit port
-python3 tools/apitest.py "http://..."   # port+token from QR URL
-python3 tools/apitest.py --no-wait      # skip the Enter prompt (non-interactive)
-python3 tools/apitest.py --debug        # hex-dump every WebSocket frame
+python3 apitest.py --port 49924   # explicit port
+python3 apitest.py "http://..."   # port+token from QR URL
+python3 apitest.py --no-wait      # skip the Enter prompt (non-interactive)
+python3 apitest.py --debug        # hex-dump every WebSocket frame
 ```
 
 ### Updating paramType mappings
@@ -523,7 +530,7 @@ encoding commands.
 | Tool | Purpose |
 |------|---------|
 | `tshark` | CLI packet capture, ships with Wireshark |
-| `gap-finder.py` | Playwright script that drives the mobile web UI while tshark captures; discovers unknown paramTypes |
+| `mobileui-dump.py` | Playwright script that drives the mobile web UI while tshark captures; discovers unknown paramTypes |
 | `apitest.py` | Directly sends every known command over WebSocket with timestamps |
 | Python protobuf decoder | Inline snippet (see below) to parse raw hex from captures |
 
@@ -574,7 +581,7 @@ zbarimg --raw -q ~/Desktop/qr_code_screenshot.png
 ```
 
 The URL contains the `port` and `token` parameters needed by `validate.py`,
-`apitest.py`, and `gap-finder.py`.
+`apitest.py`, and `mobileui-dump.py`.
 
 ### Step 3 — Capture the mobile web UI
 
@@ -587,11 +594,11 @@ sudo tshark -i lo0 -Y "websocket" -T fields \
     -E header=y > ~/mobileui-capture.txt
 
 # Terminal 2: drive every button and slider in the mobile UI
-python3 tools/gap-finder.py "http://link-controller.insta360.com/v3/link/?port=PORT&token=TOKEN"
+python3 mobileui-dump.py "http://link-controller.insta360.com/v3/link/?port=PORT&token=TOKEN"
 # Press Enter when tshark is running, then wait for the script to finish.
 ```
 
-`gap-finder.py` clicks every visible button, sweeps every slider, and prints
+`mobileui-dump.py` clicks every visible button, sweeps every slider, and prints
 a timestamped action log. Correlate the timestamps with packet hex in the capture
 to map UI actions to wire bytes.
 
@@ -607,7 +614,7 @@ sudo tshark -i lo0 -Y "websocket" -T fields \
     -E header=y > ~/apitest-capture.txt
 
 # Terminal 2
-python3 tools/apitest.py --port PORT
+python3 apitest.py --port PORT
 ```
 
 `apitest.py` also probes unknown paramTypes (8–30) with values `"1"` and `"0"`,
@@ -690,6 +697,8 @@ DeviceInfo:
   field 2  → serialNum string
   field 4  → mode int  (0=normal, 1=tracking, 4=overhead, 5=deskview, 6=whiteboard)
   field 5  → ZoomInfo message { field1=curValue, field2=minValue, field3=maxValue }
+             ⚠️  mirror is also read from field 5 as a varint fallback, but is
+             unreliable — DeviceInfo does not update after a flip command.
   field 9  → curPresetPos int
   field 10 → image settings sub-message:
                field 9  = HDR bool
@@ -698,8 +707,10 @@ DeviceInfo:
                field 14 = saturation int
                field 15 = sharpness int
                field 17 = autoExposure bool
+               field 20 = exposureComp int (0–100; 50 = 0 EV)
                field 21 = autoWhiteBalance bool
-               field 22 = wbTemp int
+               field 22 = wbTemp int (Kelvin)
+               field 24 = smartComposition bool
 ```
 
 ### Known cascade effects
@@ -723,3 +734,41 @@ Some paramTypes trigger cascades on the server side:
 - **Check `deviceInfoNotify` field numbers** — if image settings stop parsing,
   the sub-message field numbers may have shifted. Use the decoder snippet above
   on a raw capture frame to inspect the actual field layout.
+
+---
+
+## Development
+
+### Version bumping
+
+The patch version in `pyproject.toml` is bumped automatically on every commit
+via a git pre-commit hook. Activate it once after cloning:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+### CI
+
+Two GitHub Actions workflows run on every push:
+
+- **`ci.yml`** — syntax check, import check, and `--help` smoke test for all
+  subcommands (Ubuntu); Homebrew formula install + test (macOS).
+- **`release.yml`** — triggered by a version tag (`v*`): publishes to PyPI via
+  OIDC trusted publishing, then auto-updates `Formula/link-ctl.rb` with the new
+  sdist URL and SHA256 from the PyPI JSON API.
+
+### Releasing
+
+```bash
+# Tag the current commit — CI does the rest
+git tag v1.0.3
+git push origin v1.0.3
+```
+
+### Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/bump_version.py` | Bumps patch version in `pyproject.toml`; called by pre-commit hook |
+| `scripts/update_formula.py` | Updates `Formula/link-ctl.rb` from PyPI JSON API; called by release workflow |

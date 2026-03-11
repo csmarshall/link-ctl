@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: pypi
+
+    permissions:
+      id-token: write   # OIDC trusted publishing to PyPI (no stored token needed)
+      contents: write   # push formula update commit
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build sdist and wheel
+        run: |
+          pip install build
+          python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # Uses OIDC trusted publishing — no PYPI_TOKEN secret required.
+        # One-time setup: PyPI → project → Publishing → add trusted publisher:
+        #   Owner: csmarshall  Repo: link-ctl  Workflow: release.yml  Environment: pypi
+
+      - name: Update Homebrew formula
+        run: python3 scripts/update_formula.py "${GITHUB_REF_NAME#v}" Formula/link-ctl.rb
+
+      - name: Commit and push formula update
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/link-ctl.rb
+          git diff --cached --quiet && echo "Formula unchanged" && exit 0
+          git commit -m "homebrew: update formula to ${GITHUB_REF_NAME}"
+          git push

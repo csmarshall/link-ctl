@@ -526,7 +526,20 @@ async def discover_port(verbose: bool = False, debug: bool = False) -> int | Non
 
     return None
 
-# ── Debug helper ─────────────────────────────────────────────────────────────
+# ── Verbosity / logging ───────────────────────────────────────────────────────
+# 0=silent  1=quiet(errors only)  2=verbose/default  3=debug
+
+_VERBOSITY: int = 2
+
+def _info(msg: str):
+    """Print informational message to stderr (verbose and debug modes)."""
+    if _VERBOSITY >= 2:
+        print(msg, file=sys.stderr)
+
+def _warn(msg: str):
+    """Print error/warning to stderr (quiet, verbose, and debug modes)."""
+    if _VERBOSITY >= 1:
+        print(msg, file=sys.stderr)
 
 def _dbg(msg: str, data: bytes | None = None):
     if data is not None:
@@ -652,13 +665,13 @@ async def _run(port: int, payloads: list, debug: bool = False) -> int:
     try:
         await client.connect()
     except Exception as e:
-        print(f"✗ Could not connect to WebSocket on port {port}: {e}", file=sys.stderr)
+        _warn(f"✗ Could not connect to WebSocket on port {port}: {e}")
         invalidate_port_cache()
         return 3
 
     ok, err = await client.handshake()
     if not ok:
-        print(f"✗ {err}", file=sys.stderr)
+        _warn(f"✗ {err}")
         await client.close()
         invalidate_port_cache()
         return 3
@@ -681,17 +694,17 @@ async def preflight(
 
     if system in ('Darwin', 'Windows'):
         if not _controller_running():
-            print("✗ Insta360 Link Controller is not running.", file=sys.stderr)
+            _warn("✗ Insta360 Link Controller is not running.")
             if system == 'Darwin':
-                print("  Start it from /Applications/Insta360 Link Controller.app, then retry.", file=sys.stderr)
+                _warn("  Start it from /Applications/Insta360 Link Controller.app, then retry.")
             else:
-                print("  Start Insta360 Link Controller from the Start menu, then retry.", file=sys.stderr)
-            print("  Tip: You can minimize it or turn off preview — the WebSocket server stays active.", file=sys.stderr)
+                _warn("  Start Insta360 Link Controller from the Start menu, then retry.")
+            _warn("  Tip: You can minimize it or turn off preview — the WebSocket server stays active.")
             sys.exit(2)
 
         if not _camera_usb_present():
-            print("✗ Insta360 Link not detected via USB.", file=sys.stderr)
-            print("  Check the cable and try replugging. The camera requires USB power to operate.", file=sys.stderr)
+            _warn("✗ Insta360 Link not detected via USB.")
+            _warn("  Check the cable and try replugging. The camera requires USB power to operate.")
             sys.exit(2)
 
     if port_override:
@@ -699,10 +712,10 @@ async def preflight(
 
     port = await discover_port(verbose=verbose, debug=debug)
     if not port:
-        print("✗ Could not find Insta360 Link Controller WebSocket server.", file=sys.stderr)
-        print("  The app is running but the WebSocket server was not detected.", file=sys.stderr)
-        print("  Ensure you are running Link Controller v1.4.1 or later (check About in the app).", file=sys.stderr)
-        print("  Try: link-ctl discover --verbose to scan all ports.", file=sys.stderr)
+        _warn("✗ Could not find Insta360 Link Controller WebSocket server.")
+        _warn("  The app is running but the WebSocket server was not detected.")
+        _warn("  Ensure you are running Link Controller v1.4.1 or later (check About in the app).")
+        _warn("  Try: link-ctl discover --verbose to scan all ports.")
         sys.exit(2)
 
     # Connectivity test
@@ -710,21 +723,21 @@ async def preflight(
     try:
         await client.connect()
     except Exception:
-        print(f"✗ Link Controller WebSocket server found on port {port} but could not connect.", file=sys.stderr)
-        print("  The camera may be initializing. Wait a few seconds and retry.", file=sys.stderr)
+        _warn(f"✗ Link Controller WebSocket server found on port {port} but could not connect.")
+        _warn("  The camera may be initializing. Wait a few seconds and retry.")
         invalidate_port_cache()
         sys.exit(3)
 
     try:
         ok, err = await asyncio.wait_for(client.handshake(), timeout=2.0)
     except asyncio.TimeoutError:
-        print(f"✗ Link Controller WebSocket server found on port {port} but did not respond.", file=sys.stderr)
-        print("  The camera may be initializing. Wait a few seconds and retry.", file=sys.stderr)
+        _warn(f"✗ Link Controller WebSocket server found on port {port} but did not respond.")
+        _warn("  The camera may be initializing. Wait a few seconds and retry.")
         await client.close()
         sys.exit(3)
 
     if not ok:
-        print(f"✗ {err}", file=sys.stderr)
+        _warn(f"✗ {err}")
         await client.close()
         sys.exit(3)
 
@@ -913,40 +926,43 @@ async def dispatch(args, port: int, debug: bool):
     try:
         await client.connect()
     except Exception as e:
-        print(f"✗ Could not connect to WebSocket on port {port}: {e}", file=sys.stderr)
+        _warn(f"✗ Could not connect to WebSocket on port {port}: {e}")
         invalidate_port_cache()
         sys.exit(3)
 
     ok, err = await client.handshake()
     if not ok:
-        print(f"✗ {err}", file=sys.stderr)
+        _warn(f"✗ {err}")
         await client.close()
         invalidate_port_cache()
         sys.exit(3)
 
     serial = client.serial
+    # Extract current device state for verbose reporting
+    devs = (client.device_info or {}).get('devices', [])
+    dev  = devs[0] if devs else {}
     # Update zoom cache from live device info
-    if client.device_info:
-        devs = client.device_info.get('devices', [])
-        if devs and devs[0].get('zoom'):
-            state['zoom'] = devs[0]['zoom'].get('curValue', state.get('zoom', 100))
+    if dev.get('zoom'):
+        state['zoom'] = dev['zoom'].get('curValue', state.get('zoom', 100))
 
     payloads = []
 
     # ── Absolute pan/tilt (not supported in v2.2.1 velocity-only API) ─────────
     if cmd == 'pan':
-        print("✗ Absolute pan is not supported in Link Controller v2.2.1 (velocity-only API).", file=sys.stderr)
-        print("  Use pan-rel <steps> (-30..30) for relative movement.", file=sys.stderr)
+        _warn("✗ Absolute pan is not supported in Link Controller v2.2.1 (velocity-only API).")
+        _warn("  Use pan-rel <steps> (-30..30) for relative movement.")
         await client.close(); sys.exit(4)
 
     elif cmd == 'tilt':
-        print("✗ Absolute tilt is not supported in Link Controller v2.2.1 (velocity-only API).", file=sys.stderr)
-        print("  Use tilt-rel <steps> (-30..30) for relative movement.", file=sys.stderr)
+        _warn("✗ Absolute tilt is not supported in Link Controller v2.2.1 (velocity-only API).")
+        _warn("  Use tilt-rel <steps> (-30..30) for relative movement.")
         await client.close(); sys.exit(4)
 
     # ── Velocity-based pan-rel / tilt-rel (joystick pulse) ────────────────────
     elif cmd == 'pan-rel':
         steps = args.steps
+        sign = '+' if steps >= 0 else ''
+        _info(f"pan-rel: {sign}{steps} steps")
         if steps != 0:
             vel = 1.0 if steps > 0 else -1.0
             duration = abs(steps) * 0.08  # 80 ms per step
@@ -959,6 +975,8 @@ async def dispatch(args, port: int, debug: bool):
 
     elif cmd == 'tilt-rel':
         steps = args.steps
+        sign = '+' if steps >= 0 else ''
+        _info(f"tilt-rel: {sign}{steps} steps")
         if steps != 0:
             vel = 1.0 if steps > 0 else -1.0
             duration = abs(steps) * 0.08
@@ -973,19 +991,23 @@ async def dispatch(args, port: int, debug: bool):
     elif cmd == 'zoom':
         v = args.value
         if not (100 <= v <= 400):
-            print("zoom value must be 100..400", file=sys.stderr)
+            _warn("✗ zoom value must be 100..400")
             await client.close(); sys.exit(1)
+        cur = dev.get('zoom', {}).get('curValue', state.get('zoom', '?'))
+        _info(f"zoom: {cur} → {v}")
         payloads.append(build_zoom(serial, v))
         state['zoom'] = v
 
     elif cmd == 'zoom-rel':
         cur_zoom = state.get('zoom', 100)
         new_zoom = max(100, min(400, cur_zoom + args.delta))
+        _info(f"zoom: {cur_zoom} → {new_zoom}")
         payloads.append(build_zoom(serial, new_zoom))
         state['zoom'] = new_zoom
 
     # ── Center (paramType=3 resets pan/tilt; also reset zoom) ─────────────────
     elif cmd == 'center':
+        _info("center: resetting pan, tilt, and zoom")
         payloads.append(build_value_change(serial, ParamTypeV2.NORMAL_RESET))
         payloads.append(build_zoom(serial, 100))
         state['pan'] = 0; state['tilt'] = 0; state['zoom'] = 100
@@ -995,6 +1017,7 @@ async def dispatch(args, port: int, debug: bool):
         target = args.state
         if target in (None, 'toggle'):
             target = 'off' if state.get('tilt', 0) == -277920 else 'on'
+        _info(f"privacy: → {target}")
         if target == 'on':
             # Tilt full-speed down for 3.5 s — enough to reach bottom stop
             await client._send(build_joystick(serial, 0.0, -1.0))
@@ -1012,156 +1035,177 @@ async def dispatch(args, port: int, debug: bool):
     elif cmd == 'track':
         target = args.state
         if target in (None, 'toggle'):
-            devs = (client.device_info or {}).get('devices', [])
-            target = 'off' if (devs and devs[0].get('mode') == VideoMode.TRACKING) else 'on'
+            target = 'off' if (dev.get('mode') == VideoMode.TRACKING) else 'on'
+        cur = 'on' if dev.get('mode') == VideoMode.TRACKING else 'off'
+        _info(f"track: {cur} → {target}")
         payloads.append(build_value_change(serial, ParamTypeV2.AI_MODE,
                                            AIMode.TRACKING if target == 'on' else AIMode.NORMAL))
 
     elif cmd == 'deskview':
         target = args.state
         if target in (None, 'toggle'):
-            devs = (client.device_info or {}).get('devices', [])
-            target = 'off' if (devs and devs[0].get('mode') == VideoMode.DESKVIEW) else 'on'
+            target = 'off' if (dev.get('mode') == VideoMode.DESKVIEW) else 'on'
+        cur = 'on' if dev.get('mode') == VideoMode.DESKVIEW else 'off'
+        _info(f"deskview: {cur} → {target}")
         payloads.append(build_value_change(serial, ParamTypeV2.AI_MODE,
                                            AIMode.DESKVIEW if target == 'on' else AIMode.NORMAL))
 
     elif cmd == 'whiteboard':
         target = args.state
         if target in (None, 'toggle'):
-            devs = (client.device_info or {}).get('devices', [])
-            target = 'off' if (devs and devs[0].get('mode') == VideoMode.WHITEBOARD) else 'on'
+            target = 'off' if (dev.get('mode') == VideoMode.WHITEBOARD) else 'on'
+        cur = 'on' if dev.get('mode') == VideoMode.WHITEBOARD else 'off'
+        _info(f"whiteboard: {cur} → {target}")
         payloads.append(build_value_change(serial, ParamTypeV2.AI_MODE,
                                            AIMode.WHITEBOARD if target == 'on' else AIMode.NORMAL))
 
     elif cmd == 'overhead':
         target = args.state
         if target in (None, 'toggle'):
-            devs = (client.device_info or {}).get('devices', [])
-            target = 'off' if (devs and devs[0].get('mode') == VideoMode.OVERHEAD) else 'on'
+            target = 'off' if (dev.get('mode') == VideoMode.OVERHEAD) else 'on'
+        cur = 'on' if dev.get('mode') == VideoMode.OVERHEAD else 'off'
+        _info(f"overhead: {cur} → {target}")
         payloads.append(build_value_change(serial, ParamTypeV2.AI_MODE,
                                            AIMode.OVERHEAD if target == 'on' else AIMode.NORMAL))
 
     elif cmd == 'normal':
+        _info("mode: → normal")
         payloads.append(build_value_change(serial, ParamTypeV2.AI_MODE, AIMode.NORMAL))
 
     # ── Preset recall / save (PresetUpdateRequest: field6+field15) ───────────
     elif cmd == 'preset':
         idx = args.index
         if not (0 <= idx <= 19):
-            print("preset index must be 0-19", file=sys.stderr)
+            _warn("✗ preset index must be 0-19")
             await client.close(); sys.exit(1)
+        _info(f"preset {idx}: recall")
         payloads.append(build_preset_recall(serial, idx))
 
     elif cmd == 'preset-save':
         idx = args.index
         if not (0 <= idx <= 19):
-            print("preset index must be 0-19", file=sys.stderr)
+            _warn("✗ preset index must be 0-19")
             await client.close(); sys.exit(1)
+        _info(f"preset {idx}: save")
         payloads.append(build_preset_save(serial, idx))
 
     elif cmd == 'preset-delete':
         idx = args.index
         if not (0 <= idx <= 19):
-            print("preset index must be 0-19", file=sys.stderr)
+            _warn("✗ preset index must be 0-19")
             await client.close(); sys.exit(1)
+        _info(f"preset {idx}: delete")
         payloads.append(build_preset_delete(serial, idx))
 
     # ── Image / camera settings ───────────────────────────────────────────────
     elif cmd == 'hdr':
         target = args.state
         if target in (None, 'toggle'):
-            devs = (client.device_info or {}).get('devices', [])
-            target = 'off' if (devs and devs[0].get('hdr')) else 'on'
+            target = 'off' if dev.get('hdr') else 'on'
+        cur = 'on' if dev.get('hdr') else 'off'
+        _info(f"hdr: {cur} → {target}")
         payloads.append(build_value_change(serial, ParamTypeV2.HDR,
                                            "1" if target == 'on' else "0"))
 
     elif cmd == 'autofocus':
         # Note: autofocus state is not included in DeviceInfo, so smart toggle is not possible.
         # on/off are required arguments.
+        _info(f"autofocus: → {args.state}")
         payloads.append(build_value_change(serial, ParamTypeV2.AUTOFOCUS,
                                            "1" if args.state == 'on' else "0"))
 
     elif cmd == 'autoexposure':
         target = args.state
         if target in (None, 'toggle'):
-            devs = (client.device_info or {}).get('devices', [])
-            target = 'off' if (devs and devs[0].get('autoExposure')) else 'on'
+            target = 'off' if dev.get('autoExposure') else 'on'
+        cur = 'on' if dev.get('autoExposure') else 'off'
+        _info(f"autoexposure: {cur} → {target}")
         payloads.append(build_value_change(serial, ParamTypeV2.AUTO_EXPOSURE,
                                            "1" if target == 'on' else "0"))
 
     elif cmd == 'awb':
         target = args.state
         if target in (None, 'toggle'):
-            devs = (client.device_info or {}).get('devices', [])
-            target = 'off' if (devs and devs[0].get('autoWhiteBalance')) else 'on'
+            target = 'off' if dev.get('autoWhiteBalance') else 'on'
+        cur = 'on' if dev.get('autoWhiteBalance') else 'off'
+        _info(f"awb: {cur} → {target}")
         payloads.append(build_value_change(serial, ParamTypeV2.AUTO_WB,
                                            "1" if target == 'on' else "0"))
 
     elif cmd == 'mirror':
         target = args.state
         if target in (None, 'toggle'):
-            devs = (client.device_info or {}).get('devices', [])
             # Note: DeviceInfo field 5 (mirror) may not reliably reflect flip state.
             # Toggle falls back to 'on' when unknown.
-            target = 'off' if (devs and devs[0].get('mirror')) else 'on'
+            target = 'off' if dev.get('mirror') else 'on'
+        cur = 'on' if dev.get('mirror') else 'off'
+        _info(f"mirror: {cur} → {target}")
         payloads.append(build_value_change(serial, ParamTypeV2.HORIZONTAL_FLIP,
                                            "1" if target == 'on' else "0"))
 
     elif cmd == 'smartcomposition':
         target = args.state
         if target in (None, 'toggle'):
-            devs = (client.device_info or {}).get('devices', [])
-            target = 'off' if (devs and devs[0].get('smartComposition')) else 'on'
+            target = 'off' if dev.get('smartComposition') else 'on'
+        cur = 'on' if dev.get('smartComposition') else 'off'
+        _info(f"smartcomposition: {cur} → {target}")
         payloads.append(build_value_change(serial, ParamTypeV2.SMART_COMPOSITION,
                                            "1" if target == 'on' else "0"))
 
     elif cmd == 'smartcomp-frame':
         val = {'head': '1', 'halfbody': '2', 'wholebody': '3'}.get(args.frame.lower())
         if val is None:
-            print("smartcomp-frame must be: head, halfbody, wholebody", file=sys.stderr)
+            _warn("✗ smartcomp-frame must be: head, halfbody, wholebody")
             await client.close(); sys.exit(1)
+        _info(f"smartcomp-frame: → {args.frame}")
         payloads.append(build_value_change(serial, ParamTypeV2.SMART_COMP_FRAME, val))
 
     elif cmd == 'exposurecomp':
         v = args.value
         if not (0 <= v <= 100):
-            print("exposurecomp value must be 0..100 (50 = 0 EV)", file=sys.stderr)
+            _warn("✗ exposurecomp value must be 0..100 (50 = 0 EV)")
             await client.close(); sys.exit(1)
+        _info(f"exposurecomp: {dev.get('exposureComp', '?')} → {v}")
         payloads.append(build_value_change(serial, ParamTypeV2.EXPOSURE_COMP, str(v)))
 
     elif cmd == 'brightness':
         v = args.value
         if not (0 <= v <= 100):
-            print("brightness value must be 0..100", file=sys.stderr)
+            _warn("✗ brightness value must be 0..100")
             await client.close(); sys.exit(1)
+        _info(f"brightness: {dev.get('brightness', '?')} → {v}")
         payloads.append(build_value_change(serial, ParamTypeV2.BRIGHTNESS, str(v)))
 
     elif cmd == 'contrast':
         v = args.value
         if not (0 <= v <= 100):
-            print("contrast value must be 0..100", file=sys.stderr)
+            _warn("✗ contrast value must be 0..100")
             await client.close(); sys.exit(1)
+        _info(f"contrast: {dev.get('contrast', '?')} → {v}")
         payloads.append(build_value_change(serial, ParamTypeV2.CONTRAST, str(v)))
 
     elif cmd == 'saturation':
         v = args.value
         if not (0 <= v <= 100):
-            print("saturation value must be 0..100 (0=B&W, 50=default)", file=sys.stderr)
+            _warn("✗ saturation value must be 0..100 (0=B&W, 50=default)")
             await client.close(); sys.exit(1)
+        _info(f"saturation: {dev.get('saturation', '?')} → {v}")
         payloads.append(build_value_change(serial, ParamTypeV2.SATURATION, str(v)))
 
     elif cmd == 'sharpness':
         v = args.value
         if not (0 <= v <= 100):
-            print("sharpness value must be 0..100", file=sys.stderr)
+            _warn("✗ sharpness value must be 0..100")
             await client.close(); sys.exit(1)
+        _info(f"sharpness: {dev.get('sharpness', '?')} → {v}")
         payloads.append(build_value_change(serial, ParamTypeV2.SHARPNESS, str(v)))
 
     elif cmd == 'wb-temp':
         v = args.value
         if not (2800 <= v <= 10000):
-            print("wb-temp value must be 2800..10000 (Kelvin); AWB must be off", file=sys.stderr)
+            _warn("✗ wb-temp value must be 2800..10000 (Kelvin); AWB must be off")
             await client.close(); sys.exit(1)
+        _info(f"wb-temp: {dev.get('wbTemp', '?')} → {v} K")
         payloads.append(build_value_change(serial, ParamTypeV2.WB_TEMP, str(v)))
 
     elif cmd == 'gesture-zoom':
@@ -1169,6 +1213,7 @@ async def dispatch(args, port: int, debug: bool):
         if target in (None, 'toggle'):
             # DeviceInfo has no gesture-zoom readback; default to 'on' when unknown
             target = 'on'
+        _info(f"gesture-zoom: → {target}")
         payloads.append(build_value_change(serial, ParamTypeV2.GESTURE_ZOOM,
                                            "1" if target == 'on' else "0"))
 
@@ -1176,8 +1221,9 @@ async def dispatch(args, port: int, debug: bool):
         mode = args.mode.lower()
         val = {'auto': '0', '50hz': '1', '60hz': '2'}.get(mode)
         if val is None:
-            print("anti-flicker mode must be: auto, 50hz, 60hz", file=sys.stderr)
+            _warn("✗ anti-flicker mode must be: auto, 50hz, 60hz")
             await client.close(); sys.exit(1)
+        _info(f"anti-flicker: → {mode}")
         payloads.append(build_value_change(serial, ParamTypeV2.ANTI_FLICKER, val))
 
     for payload in payloads:
@@ -1227,9 +1273,9 @@ def build_parser() -> argparse.ArgumentParser:
   wb-temp  <2800-10000>  white balance temperature in Kelvin (AWB must be off)
 
   ── Presets ─────────────────────────────────────────────────────────
-  preset        <0-8>    recall saved preset position
-  preset-save   <0-8>    save current position as preset
-  preset-delete <0-8>    delete a preset slot
+  preset        <0-19>   recall saved preset position
+  preset-save   <0-19>   save current position as preset
+  preset-delete <0-19>   delete a preset slot
 
   ── Diagnostics ─────────────────────────────────────────────────────
   status                 show device info as JSON
@@ -1239,7 +1285,10 @@ def build_parser() -> argparse.ArgumentParser:
 toggle commands: omit the argument to smart-toggle based on current state
 """,
     )
-    p.add_argument('--debug',          action='store_true', help='Hex-dump WebSocket frames (stderr)')
+    p.add_argument('-d', '--debug',   action='store_true', help='Hex-dump WebSocket frames (stderr)')
+    p.add_argument('-v', '--verbose', action='store_true', help='Show current and new values on change (default)')
+    p.add_argument('-q', '--quiet',   action='store_true', help='Suppress informational output; show errors only')
+    p.add_argument('-s', '--silent',  action='store_true', help='Suppress all output including errors')
     p.add_argument('--port',     type=int,                  help='Override WebSocket port discovery')
     p.add_argument('--skip-preflight', action='store_true', help='Skip preflight checks')
 
@@ -1294,11 +1343,21 @@ toggle commands: omit the argument to smart-toggle based on current state
     return p
 
 def main():
+    global _VERBOSITY
     parser = build_parser()
     args   = parser.parse_args()
     debug  = args.debug
     system = platform.system()
     cmd    = args.command
+
+    # Set verbosity (silent < quiet < verbose < debug)
+    if args.silent:
+        _VERBOSITY = 0
+    elif args.quiet:
+        _VERBOSITY = 1
+    elif args.debug:
+        _VERBOSITY = 3
+    # --verbose is explicit but same as default (2); no change needed
 
     # ── Diagnostics that don't need a full connection ─────────────────────────
     if cmd == 'discover':
@@ -1316,7 +1375,7 @@ def main():
     # ── Platform-specific AI mode restriction ─────────────────────────────────
     AI_CMDS = {'track', 'deskview', 'whiteboard', 'overhead', 'normal'}
     if system == 'Linux' and cmd in AI_CMDS:
-        print("AI modes require Insta360 Link Controller (macOS/Windows only).", file=sys.stderr)
+        _warn("✗ AI modes require Insta360 Link Controller (macOS/Windows only).")
         sys.exit(4)
 
     # ── Linux PTZ via v4l2-ctl ────────────────────────────────────────────────
@@ -1334,7 +1393,7 @@ def main():
             state = load_state()
             port  = state.get('port')
         if not port:
-            print("✗ No port available. Use --port N or run without --skip-preflight.", file=sys.stderr)
+            _warn("✗ No port available. Use --port N or run without --skip-preflight.")
             sys.exit(2)
 
     # ── Run command ───────────────────────────────────────────────────────────

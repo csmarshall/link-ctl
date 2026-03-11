@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "link-ctl"
-version = "1.0.1"
+version = "1.0.4"
 description = "CLI controller for Insta360 Link webcam via Link Controller app"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -20,6 +20,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Environment :: Console",
     "Topic :: Multimedia :: Video",
     "Topic :: Home Automation",
