@@ -3,8 +3,8 @@ class LinkCtl < Formula
 
   desc "CLI controller for Insta360 Link webcam via Link Controller app"
   homepage "https://github.com/csmarshall/link-ctl"
-  url "https://files.pythonhosted.org/packages/96/7e/b21554c6d259367547f6002612db35ba20fd7f0dd00ade1a662ee4a78aaa/link_ctl-1.0.0.tar.gz"
-  sha256 "29c93cf207cfcb3ee56b61ccbfeaa28d742511dd7288282f122b12e4dccd3a92"
+  url "https://files.pythonhosted.org/packages/57/e5/62018bd780fa26ca95cc624ce11534e5d6af3a1fb2add612964b51ac033a/link_ctl-1.0.6.tar.gz"
+  sha256 "132038841d1a0f9d6000baae453ffe9575dd4a5f640112f230eabb2f0bd37748"
   license "MIT"
 
   depends_on "python@3.11"
