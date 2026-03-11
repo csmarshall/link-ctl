@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+*.egg
+
+# Dev tool screenshots and captures
+gap-finder-screenshots/
+gap2-screenshots/
+*.txt
+
+# Claude memory
+.claude/
+
+# macOS
+.DS_Store

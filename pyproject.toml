@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "link-ctl"
+version = "1.0.0"
+description = "CLI controller for Insta360 Link webcam via Link Controller app"
+requires-python = ">=3.11"
+dependencies = [
+    "websockets>=11",
+]
+
+[project.scripts]
+link-ctl = "link_ctl:main"
+
+[tool.setuptools]
+py-modules = ["link_ctl"]
