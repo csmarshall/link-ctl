@@ -42,4 +42,4 @@ jobs:
           git add Formula/link-ctl.rb
           git diff --cached --quiet && echo "Formula unchanged" && exit 0
           git commit -m "homebrew: update formula to ${GITHUB_REF_NAME}"
-          git push
+          git push origin HEAD:main

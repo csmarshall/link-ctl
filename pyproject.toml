@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "link-ctl"
-version = "1.0.5"
+version = "1.0.6"
 description = "CLI controller for Insta360 Link webcam via Link Controller app"
 readme = "README.md"
 license = {file = "LICENSE"}

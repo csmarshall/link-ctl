@@ -1019,9 +1019,12 @@ async def dispatch(args, port: int, debug: bool):
             target = 'off' if state.get('tilt', 0) == -277920 else 'on'
         _info(f"privacy: → {target}")
         if target == 'on':
-            # Tilt full-speed down for 3.5 s — enough to reach bottom stop
+            # Center first so we always start from a known position, then tilt
+            # full-speed down for 4 s — enough to reach the bottom stop from center.
+            await client._send(build_value_change(serial, ParamTypeV2.NORMAL_RESET))
+            await asyncio.sleep(0.5)
             await client._send(build_joystick(serial, 0.0, -1.0))
-            await asyncio.sleep(3.5)
+            await asyncio.sleep(4.0)
             await client._send(build_joystick_stop(serial))
             state['tilt'] = -277920
             await client.close()
