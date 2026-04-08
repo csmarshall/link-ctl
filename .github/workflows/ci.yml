@@ -19,7 +19,7 @@ jobs:
         run: pip install .
 
       - name: Syntax check
-        run: python -m py_compile link_ctl.py validate.py scripts/bump_version.py scripts/update_formula.py
+        run: python -m py_compile link_ctl.py tools/validate.py link_usb.py scripts/bump_version.py scripts/update_formula.py
 
       - name: Import check
         run: python -c "import link_ctl"

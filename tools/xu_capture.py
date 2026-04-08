@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
-"""xu_capture.py — Synthetic USB capture, replay, and validation harness.
+"""xu_capture.py — Automated XU control discovery via uvc-probe + WebSocket.
 
-Automates reverse-engineering the Insta360 Link's UVC Extension Unit protocol
-by capturing USB traffic while triggering known operations, then replaying the
-captured XU commands directly (without the desktop app) and validating state.
+Reverse-engineers the Insta360 Link's UVC Extension Unit protocol by:
+  1. Reading XU register state via uvc-probe (IOKit, non-exclusive)
+  2. Triggering operations via WebSocket (link_ctl.py API)
+  3. Reading XU state again and diffing
+
+No tshark, no SIP disable, no pcap — just direct XU register reads via IOKit
+while the desktop app stays running.
 
 Architecture
 ────────────
-Phase A — CAPTURE: Trigger operations while USB-sniffing
-  1. Start tshark USB capture on the appropriate interface
-  2. Ensure the desktop app is running (launch if needed)
-  3. For each operation (zoom, tracking, HDR, privacy, etc.):
-     a. Record timestamp
-     b. Trigger via WebSocket (existing API) or AppleScript (GUI-only)
+Phase A — CAPTURE: Snapshot XU state, trigger operation, snapshot again, diff
+  1. Start `sudo tools/uvc-probe server` as a subprocess
+  2. Ensure the desktop app is running (WS server must be up)
+  3. For each operation:
+     a. Take "before" snapshot (send newline to uvc-probe server)
+     b. Trigger via WebSocket (existing link_ctl API)
      c. Wait for settling
-     d. Trigger inverse/reset
-     e. Record timestamp
-  4. Stop tshark capture
-  5. Parse pcap file — correlate timestamps to USB control transfers
-  6. Output: {operation → [xu_selector, xu_data_bytes]}
+     d. Take "after" snapshot
+     e. Diff → record changed {unit, sel, before_hex, after_hex}
+     f. Trigger inverse/reset, snapshot again
+  4. Output: {operation → [changed unit/sel/before/after bytes]}
 
 Phase B — REPLAY: Send captured XU bytes without the desktop app
   1. Kill the desktop app
@@ -27,56 +30,31 @@ Phase B — REPLAY: Send captured XU bytes without the desktop app
   4. Read device state via WebSocket (LinkClient) and validate
 
 Phase C — REPORT: Generate validated command mapping
-  1. JSON file with {command, xu_selector, xu_data_hex, validated: bool}
+  1. JSON file with {command, xu_unit, xu_selector, data_hex, validated: bool}
 
 Prerequisites
 ─────────────
-  1. Insta360 Link camera connected and desktop app installed
-  2. tshark installed (brew install wireshark / apt install tshark)
-  3. USB capture interface available:
-     - macOS: sudo ifconfig XHC20 up (may require SIP disabled on Catalina+)
-     - Linux: sudo modprobe usbmon
+  1. Insta360 Link camera connected and desktop app running
+  2. tools/uvc-probe compiled (clang command in uvc-probe.m header)
+  3. sudo access (uvc-probe needs IOKit USB access)
   4. For Phase B replay: link_usb.py (in parent directory)
 
 Usage
 ─────
   # Full capture → replay → validate cycle
-  python tools/xu_capture.py
+  sudo python tools/xu_capture.py
+
+  # Capture only (no replay)
+  sudo python tools/xu_capture.py --capture-only
 
   # Dry-run: show planned operations without doing anything
   python tools/xu_capture.py --dry-run
 
-  # Analyze a pre-existing pcap file (skip Phase A capture)
-  python tools/xu_capture.py --pcap /path/to/capture.pcapng
+  # Run specific operations only
+  sudo python tools/xu_capture.py --only zoom,hdr,brightness
 
-  # Calibrate AppleScript button positions for GUI automation
-  python tools/xu_capture.py --calibrate
-
-  # Run only Phase A (capture) without replay/validation
-  python tools/xu_capture.py --capture-only
-
-  # Run only Phase B (replay) using a previous capture report
-  python tools/xu_capture.py --replay report.json
-
-USB capture setup
-─────────────────
-macOS:
-  # Check if XHC20 interface exists
-  ifconfig -l | grep XHC
-
-  # Enable it (may need SIP disabled on Catalina+)
-  sudo ifconfig XHC20 up
-
-  # If XHC20 doesn't exist, SIP may need to be disabled:
-  #   1. Boot into Recovery (hold power on Apple Silicon, Cmd+R on Intel)
-  #   2. Terminal → csrutil disable → reboot
-  #   3. After capture, re-enable: csrutil enable
-
-Linux:
-  sudo modprobe usbmon
-  # Find the right bus number for the camera:
-  lsusb | grep -i insta
-  # Bus 001 → usbmon1, Bus 002 → usbmon2, etc.
+  # Custom settle time (seconds)
+  sudo python tools/xu_capture.py --settle 3.0
 """
 from __future__ import annotations
 
@@ -85,8 +63,7 @@ import asyncio
 import json
 import os
 import platform
-import shutil
-import signal
+import re
 import subprocess
 import sys
 import time
@@ -116,339 +93,427 @@ def sep(label: str):
 
 # ── Operations to capture ────────────────────────────────────────────────────
 
-@dataclass
-class Operation:
-    """A single operation to trigger during Phase A capture."""
-    name: str
-    trigger: str           # 'ws' or 'applescript'
-    description: str
-    # For WS-triggered operations:
-    ws_param_type: int = 0
-    ws_on_value: str = ''
-    ws_off_value: str = ''
-    # For AppleScript-triggered operations:
-    applescript_on: str = ''
-    applescript_off: str = ''
-    # Settling time after each command
-    settle_seconds: float = 2.0
-    # Expected XU selector (best guess from proto; confirmed by capture)
-    expected_xu_selector: int = -1
+from typing import Callable, Awaitable
 
+# Type for custom async trigger: (port, token) -> None
+TriggerFunc = Callable[[int, str], Awaitable[None]]
 
-# WebSocket-triggered operations (reuse existing known paramTypes from link_ctl)
-WS_OPERATIONS = [
-    Operation('zoom', 'ws', 'Zoom 100 → 400 → 100',
-              ws_param_type=4, ws_on_value='400', ws_off_value='100',
-              expected_xu_selector=4, settle_seconds=2.0),
-    Operation('tracking_on', 'ws', 'AI Tracking on → off',
-              ws_param_type=5, ws_on_value='1', ws_off_value='0',
-              expected_xu_selector=2, settle_seconds=3.0),
-    Operation('deskview', 'ws', 'DeskView on → off',
-              ws_param_type=5, ws_on_value='5', ws_off_value='0',
-              expected_xu_selector=2, settle_seconds=3.0),
-    Operation('whiteboard', 'ws', 'Whiteboard on → off',
-              ws_param_type=5, ws_on_value='6', ws_off_value='0',
-              expected_xu_selector=2, settle_seconds=3.0),
-    Operation('overhead', 'ws', 'Overhead on → off',
-              ws_param_type=5, ws_on_value='4', ws_off_value='0',
-              expected_xu_selector=2, settle_seconds=3.0),
-    Operation('hdr', 'ws', 'HDR on → off',
-              ws_param_type=26, ws_on_value='1', ws_off_value='0',
-              settle_seconds=2.0),
-    Operation('brightness', 'ws', 'Brightness 50 → 100 → 50',
-              ws_param_type=22, ws_on_value='100', ws_off_value='50',
-              settle_seconds=1.5),
-    Operation('contrast', 'ws', 'Contrast 50 → 100 → 50',
-              ws_param_type=23, ws_on_value='100', ws_off_value='50',
-              settle_seconds=1.5),
-    Operation('saturation', 'ws', 'Saturation 50 → 0 → 50',
-              ws_param_type=24, ws_on_value='0', ws_off_value='50',
-              settle_seconds=1.5),
-    Operation('sharpness', 'ws', 'Sharpness 50 → 100 → 50',
-              ws_param_type=25, ws_on_value='100', ws_off_value='50',
-              settle_seconds=1.5),
-    Operation('autoexposure', 'ws', 'Auto Exposure off → on',
-              ws_param_type=17, ws_on_value='0', ws_off_value='1',
-              expected_xu_selector=30, settle_seconds=2.0),
-    Operation('awb', 'ws', 'Auto White Balance off → on',
-              ws_param_type=20, ws_on_value='0', ws_off_value='1',
-              settle_seconds=2.0),
-    Operation('anti_flicker_50', 'ws', 'Anti-flicker → 50Hz → Auto',
-              ws_param_type=27, ws_on_value='1', ws_off_value='0',
-              settle_seconds=1.5),
-    Operation('anti_flicker_60', 'ws', 'Anti-flicker → 60Hz → Auto',
-              ws_param_type=27, ws_on_value='2', ws_off_value='0',
-              settle_seconds=1.5),
-    Operation('mirror', 'ws', 'Mirror on → off',
-              ws_param_type=2, ws_on_value='1', ws_off_value='0',
-              settle_seconds=2.0),
-    Operation('gesture_zoom', 'ws', 'Gesture zoom on → off',
-              ws_param_type=39, ws_on_value='1', ws_off_value='0',
-              expected_xu_selector=5, settle_seconds=2.0),
-    Operation('autofocus', 'ws', 'Auto focus off → on',
-              ws_param_type=18, ws_on_value='0', ws_off_value='1',
-              expected_xu_selector=15, settle_seconds=2.0),
-]
-
-# AppleScript-triggered operations (GUI-only features not in WS API)
-APPLESCRIPT_OPERATIONS = [
-    Operation('privacy', 'applescript', 'Privacy mode on → off',
-              expected_xu_selector=27, settle_seconds=3.0,
-              applescript_on='_privacy_toggle_on',
-              applescript_off='_privacy_toggle_off'),
-]
-
-ALL_OPERATIONS = WS_OPERATIONS + APPLESCRIPT_OPERATIONS
-
-
-# ── Calibration data ─────────────────────────────────────────────────────────
-
-CALIBRATION_FILE = Path.home() / '.config' / 'link-ctl' / 'gui_calibration.json'
-
-DEFAULT_CALIBRATION = {
-    'app_name': 'Insta360 Link Controller',
-    'privacy_button': {
-        'description': 'Privacy toggle button position (x, y) in app window',
-        'x': None,
-        'y': None,
-        'method': 'click_at_position',
-        'notes': 'Run --calibrate to set these positions',
-    },
+# Known value ranges for specific paramTypes
+PARAM_DEFAULTS: dict[int, tuple[str, str]] = {
+    # paramType: (low/off value, high/on value)
+    4:  ('100', '400'),     # zoom
+    5:  ('0', '1'),         # AI mode (0=normal)
+    21: ('6500', '2800'),   # WB temp Kelvin
+    27: ('0', '1'),         # anti-flicker (0=auto)
 }
 
 
-def load_calibration() -> dict:
-    if CALIBRATION_FILE.exists():
-        try:
-            return json.loads(CALIBRATION_FILE.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return DEFAULT_CALIBRATION
+@dataclass
+class Operation:
+    """A single operation to trigger during Phase A capture.
 
-
-def save_calibration(cal: dict) -> None:
-    CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CALIBRATION_FILE.write_text(json.dumps(cal, indent=2))
-
-
-# ── AppleScript GUI automation ───────────────────────────────────────────────
-
-def _run_applescript(script: str) -> str:
-    """Run an AppleScript and return stdout."""
-    result = subprocess.run(
-        ['osascript', '-e', script],
-        capture_output=True, text=True, timeout=15)
-    if result.returncode != 0:
-        log(f'  AppleScript error: {result.stderr.strip()}')
-    return result.stdout.strip()
-
-
-def _activate_app(app_name: str) -> None:
-    """Bring the desktop app to the front."""
-    _run_applescript(f'''
-        tell application "{app_name}"
-            activate
-        end tell
-    ''')
-    time.sleep(0.5)
-
-
-def _get_app_window_bounds(app_name: str) -> dict | None:
-    """Get the app window position and size."""
-    out = _run_applescript(f'''
-        tell application "System Events"
-            tell process "{app_name}"
-                if (count of windows) > 0 then
-                    set w to window 1
-                    set p to position of w
-                    set s to size of w
-                    return (item 1 of p as text) & "," & (item 2 of p as text) & "," & (item 1 of s as text) & "," & (item 2 of s as text)
-                end if
-            end tell
-        end tell
-    ''')
-    if out:
-        try:
-            parts = [int(x) for x in out.split(',')]
-            return {'x': parts[0], 'y': parts[1], 'width': parts[2], 'height': parts[3]}
-        except (ValueError, IndexError):
-            pass
-    return None
-
-
-def _click_at_position(x: int, y: int) -> None:
-    """Click at absolute screen coordinates using AppleScript."""
-    _run_applescript(f'''
-        tell application "System Events"
-            click at {{{x}, {y}}}
-        end tell
-    ''')
-
-
-def applescript_privacy_toggle(cal: dict, action: str) -> bool:
-    """Toggle privacy mode via AppleScript GUI automation.
-
-    Returns True if the action was performed (or attempted).
+    For simple paramType operations: set ws_param_type + test_value.
+    For multi-step sequences (e.g. privacy): set trigger_on/trigger_off callbacks.
     """
-    app_name = cal.get('app_name', 'Insta360 Link Controller')
-    privacy = cal.get('privacy_button', {})
-    x, y = privacy.get('x'), privacy.get('y')
+    name: str
+    description: str
+    ws_param_type: int = 0
+    test_value: str = ''
+    restore_value: str = ''    # explicit restore value (overrides auto-detect)
+    ws_state_key: str = ''     # key in device info to read current state
+    settle_seconds: float = 2.0
+    trigger_on: TriggerFunc | None = None   # custom async trigger for "set"
+    trigger_off: TriggerFunc | None = None  # custom async trigger for "restore"
 
-    if x is None or y is None:
-        log('  Privacy button position not calibrated.')
-        log('  Run: python tools/xu_capture.py --calibrate')
-        log('  Falling back to manual prompt...')
-        input(f'  → Toggle privacy {action.upper()} in the desktop app, then press Enter: ')
-        return True
+    @property
+    def is_custom(self) -> bool:
+        return self.trigger_on is not None
 
-    _activate_app(app_name)
+    def pick_values(self, device_state: dict | None) -> tuple[str, str]:
+        """Return (test_value, restore_value) based on current device state."""
+        if self.is_custom:
+            return self.test_value or 'on', self.restore_value or 'off'
+
+        test = self.test_value
+        restore = self.restore_value or self._opposite(test)
+
+        if device_state and self.ws_state_key:
+            cur = device_state.get(self.ws_state_key)
+            if cur is not None:
+                cur_str = self._state_to_param(cur)
+                if cur_str == test:
+                    test, restore = restore, test
+                else:
+                    restore = cur_str
+        return test, restore
+
+    def _opposite(self, val: str) -> str:
+        """Return a plausible opposite/default value for restore."""
+        if self.ws_param_type in PARAM_DEFAULTS:
+            low, high = PARAM_DEFAULTS[self.ws_param_type]
+            return low if val == high else high
+        if val in ('0', '1'):
+            return '1' if val == '0' else '0'
+        return '50'
+
+    def _state_to_param(self, state_val) -> str:
+        if isinstance(state_val, bool):
+            return '1' if state_val else '0'
+        if isinstance(state_val, dict):
+            return str(state_val.get('curValue', 100))
+        return str(state_val)
+
+
+# ── Custom trigger: privacy mode ─────────────────────────────────────────────
+
+async def _preset_save_recall(port: int, token: str) -> None:
+    """Save current position as preset 19 (scratch slot), then recall preset 0."""
+    from link_ctl import LinkClient, build_preset_save, build_preset_recall
+    client = LinkClient(port, token=token)
+    await client.connect()
+    ok, _ = await client.handshake()
+    if not ok:
+        await client.close()
+        return
+    # Save current position to slot 19 (scratch)
+    await client._send(build_preset_save(client.serial, 19))
+    await asyncio.sleep(1.0)
+    # Recall preset 0 (should move camera if position differs)
+    await client._send(build_preset_recall(client.serial, 0))
+    await client.close()
+
+
+async def _preset_restore(port: int, token: str) -> None:
+    """Recall preset 19 (our scratch save), then delete it."""
+    from link_ctl import LinkClient, build_preset_recall, build_preset_delete
+    client = LinkClient(port, token=token)
+    await client.connect()
+    ok, _ = await client.handshake()
+    if not ok:
+        await client.close()
+        return
+    await client._send(build_preset_recall(client.serial, 19))
+    await asyncio.sleep(2.0)
+    await client._send(build_preset_delete(client.serial, 19))
+    await client.close()
+
+
+async def _camera_off(port: int, token: str) -> None:
+    """Turn camera preview OFF via desktop app GUI click."""
+    _click_app_camera_toggle()
+    await asyncio.sleep(3.0)
+
+
+async def _camera_on(port: int, token: str) -> None:
+    """Turn camera preview ON via desktop app GUI click."""
+    _click_app_camera_toggle()
+    await asyncio.sleep(3.0)
+
+
+def _click_app_camera_toggle() -> None:
+    """Click the camera on/off toggle in the desktop app via cliclick.
+
+    Activates the app first, then clicks the camera toggle button.
+    Button position discovered via cliclick p with manual hover.
+    The position is window-relative, so we read the window position
+    each time and offset from it.
+    """
+    # Activate the app
+    subprocess.run(
+        ['osascript', '-e', 'tell application "Insta360 Link Controller" to activate'],
+        capture_output=True, timeout=5)
     time.sleep(0.3)
 
-    # Get current window bounds to compute absolute position
-    bounds = _get_app_window_bounds(app_name)
-    if bounds:
-        abs_x = bounds['x'] + x
-        abs_y = bounds['y'] + y
-        log(f'  Clicking privacy button at ({abs_x}, {abs_y})')
-        _click_at_position(abs_x, abs_y)
-    else:
-        log(f'  Could not get window bounds; clicking at ({x}, {y}) as absolute')
-        _click_at_position(x, y)
+    # Get current window position so we can compute absolute click coords
+    result = subprocess.run(
+        ['osascript', '-e',
+         'tell application "System Events" to tell process "Webcam-desktop" '
+         'to return position of window 1'],
+        capture_output=True, text=True, timeout=5)
+    # Parse "x, y" response
+    try:
+        parts = result.stdout.strip().split(',')
+        wx, wy = int(parts[0].strip()), int(parts[1].strip())
+    except (ValueError, IndexError):
+        # Fallback to last known absolute position
+        wx, wy = 940, 528
 
-    return True
+    # Camera toggle is at ~(123, 694) relative to window top-left
+    # Discovered: absolute (1063, 1222) with window at (940, 528)
+    cx = wx + 123
+    cy = wy + 694
+    subprocess.run(['cliclick', f'c:{cx},{cy}'], capture_output=True, timeout=5)
 
 
-# ── Calibration mode ─────────────────────────────────────────────────────────
-
-def run_calibrate():
-    """Interactive calibration: identify GUI button positions."""
-    sep('CALIBRATION MODE')
-    cal = load_calibration()
-    app_name = cal.get('app_name', 'Insta360 Link Controller')
-
-    print(f'This will help you identify button positions in "{app_name}".')
-    print(f'The app must be open and visible.\n')
-
-    _activate_app(app_name)
-    bounds = _get_app_window_bounds(app_name)
-    if bounds:
-        print(f'Window found: position=({bounds["x"]}, {bounds["y"]}), '
-              f'size=({bounds["width"]}x{bounds["height"]})')
-    else:
-        print('Could not find the app window. Is it open?')
+async def _joystick_pan_right(port: int, token: str) -> None:
+    """Pan right at half speed for 1.5s, then stop."""
+    from link_ctl import LinkClient, build_joystick, build_joystick_stop
+    client = LinkClient(port, token=token)
+    await client.connect()
+    ok, _ = await client.handshake()
+    if not ok:
+        await client.close()
         return
-
-    print(f'\n── Privacy Button ──')
-    print(f'Move your mouse over the privacy toggle button in the app.')
-    print(f'Enter the position RELATIVE to the app window (not screen coordinates).')
-    print(f'Tip: window top-left is (0, 0).')
-
-    try:
-        x_str = input('  Privacy button X (relative to window): ').strip()
-        y_str = input('  Privacy button Y (relative to window): ').strip()
-        x, y = int(x_str), int(y_str)
-        cal['privacy_button'] = {
-            'x': x, 'y': y,
-            'method': 'click_at_position',
-            'description': 'Privacy toggle button position relative to window',
-        }
-        save_calibration(cal)
-        print(f'\n  Saved: privacy button at ({x}, {y}) relative to window.')
-        print(f'  Config: {CALIBRATION_FILE}')
-
-        # Test click
-        test = input('\n  Test the click now? (y/n): ').strip().lower()
-        if test == 'y':
-            abs_x = bounds['x'] + x
-            abs_y = bounds['y'] + y
-            print(f'  Clicking at ({abs_x}, {abs_y})...')
-            _click_at_position(abs_x, abs_y)
-            print(f'  Did the privacy button toggle? If not, adjust coordinates.')
-
-    except (ValueError, KeyboardInterrupt):
-        print('\nCalibration cancelled.')
+    await client._send(build_joystick(client.serial, 0.5, 0.0))
+    await asyncio.sleep(1.5)
+    await client._send(build_joystick_stop(client.serial))
+    await client.close()
 
 
-# ── tshark USB capture management ────────────────────────────────────────────
-
-def find_usb_capture_interface() -> str | None:
-    """Find the USB capture interface for tshark."""
-    system = platform.system()
-    if system == 'Darwin':
-        # macOS: XHC20, XHC0, etc.
-        try:
-            out = subprocess.run(['ifconfig', '-l'], capture_output=True, text=True, timeout=5)
-            for iface in out.stdout.split():
-                if iface.startswith('XHC'):
-                    return iface
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-        return None
-
-    elif system == 'Linux':
-        # Linux: usbmonN
-        # Find the bus number for the Insta360 Link
-        try:
-            out = subprocess.run(['lsusb'], capture_output=True, text=True, timeout=5)
-            for line in out.stdout.splitlines():
-                if 'insta360' in line.lower():
-                    # "Bus 001 Device 003: ..."
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        bus = parts[1].lstrip('0') or '0'
-                        return f'usbmon{bus}'
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-        # Fallback: try usbmon0 (captures all buses)
-        if os.path.exists('/dev/usbmon0'):
-            return 'usbmon0'
-        return None
-
-    return None
+async def _joystick_pan_left(port: int, token: str) -> None:
+    """Pan left at half speed for 1.5s, then stop."""
+    from link_ctl import LinkClient, build_joystick, build_joystick_stop
+    client = LinkClient(port, token=token)
+    await client.connect()
+    ok, _ = await client.handshake()
+    if not ok:
+        await client.close()
+        return
+    await client._send(build_joystick(client.serial, -0.5, 0.0))
+    await asyncio.sleep(1.5)
+    await client._send(build_joystick_stop(client.serial))
+    await client.close()
 
 
-def check_tshark() -> bool:
-    """Check if tshark is available."""
-    return shutil.which('tshark') is not None
+async def _joystick_tilt_up(port: int, token: str) -> None:
+    """Tilt up at half speed for 1.5s, then stop."""
+    from link_ctl import LinkClient, build_joystick, build_joystick_stop
+    client = LinkClient(port, token=token)
+    await client.connect()
+    ok, _ = await client.handshake()
+    if not ok:
+        await client.close()
+        return
+    await client._send(build_joystick(client.serial, 0.0, 0.5))
+    await asyncio.sleep(1.5)
+    await client._send(build_joystick_stop(client.serial))
+    await client.close()
 
 
-def start_tshark_capture(interface: str, output_file: str) -> subprocess.Popen | None:
-    """Start tshark USB capture in the background."""
-    if not check_tshark():
-        log('tshark not found. Install: brew install wireshark (macOS) or apt install tshark (Linux)')
-        return None
-
-    cmd = [
-        'sudo', 'tshark',
-        '-i', interface,
-        '-w', output_file,
-        # Capture USB control transfers
-        '-f', 'usb',
-    ]
-    log(f'Starting tshark: {" ".join(cmd)}')
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        time.sleep(2)  # Let tshark initialize
-        if proc.poll() is not None:
-            stderr = proc.stderr.read().decode() if proc.stderr else ''
-            log(f'tshark failed to start: {stderr}')
-            return None
-        log(f'tshark capturing on {interface} → {output_file}')
-        return proc
-    except (FileNotFoundError, PermissionError) as e:
-        log(f'Failed to start tshark: {e}')
-        return None
+async def _center_reset(port: int, token: str) -> None:
+    """Center reset (paramType=3)."""
+    await ws_send_command(port, token, 3, '')
 
 
-def stop_tshark(proc: subprocess.Popen) -> None:
-    """Stop a running tshark capture."""
-    if proc and proc.poll() is None:
-        proc.send_signal(signal.SIGINT)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        log('tshark stopped')
+async def _awb_off_then_wb(port: int, token: str) -> None:
+    """Disable AWB, then set WB temp to 2800K (AWB must be off for temp to take effect)."""
+    await ws_send_command(port, token, 20, '0')    # AWB off
+    await asyncio.sleep(1.0)
+    await ws_send_command(port, token, 21, '2800')  # WB temp 2800K
+
+
+async def _awb_restore_wb(port: int, token: str) -> None:
+    """Set WB temp to 6500K, then re-enable AWB."""
+    await ws_send_command(port, token, 21, '6500')  # WB temp 6500K
+    await asyncio.sleep(0.5)
+    await ws_send_command(port, token, 20, '1')    # AWB on
+
+
+# ── Operations list ──────────────────────────────────────────────────────────
+
+OPERATIONS = [
+    Operation('zoom', 'Zoom to 400',
+              ws_param_type=4, test_value='400',
+              ws_state_key='zoom', settle_seconds=2.0),
+    Operation('tracking', 'AI Tracking on',
+              ws_param_type=5, test_value='1',
+              ws_state_key='mode', settle_seconds=3.0),
+    Operation('deskview', 'DeskView on',
+              ws_param_type=5, test_value='5',
+              ws_state_key='mode', settle_seconds=3.0),
+    Operation('whiteboard', 'Whiteboard on',
+              ws_param_type=5, test_value='6',
+              ws_state_key='mode', settle_seconds=3.0),
+    Operation('overhead', 'Overhead on',
+              ws_param_type=5, test_value='4',
+              ws_state_key='mode', settle_seconds=3.0),
+    Operation('hdr', 'HDR toggle',
+              ws_param_type=26, test_value='1',
+              ws_state_key='hdr', settle_seconds=3.0),
+    Operation('brightness', 'Brightness to 100',
+              ws_param_type=22, test_value='100',
+              ws_state_key='brightness', settle_seconds=1.5),
+    Operation('contrast', 'Contrast to 100',
+              ws_param_type=23, test_value='100',
+              ws_state_key='contrast', settle_seconds=1.5),
+    Operation('saturation', 'Saturation to 0',
+              ws_param_type=24, test_value='0',
+              ws_state_key='saturation', settle_seconds=1.5),
+    Operation('sharpness', 'Sharpness to 100',
+              ws_param_type=25, test_value='100',
+              ws_state_key='sharpness', settle_seconds=1.5),
+    Operation('exposurecomp', 'Exposure comp to 100',
+              ws_param_type=16, test_value='100',
+              ws_state_key='exposureComp', settle_seconds=1.5),
+    Operation('autoexposure', 'Auto Exposure toggle',
+              ws_param_type=17, test_value='0',
+              ws_state_key='autoExposure', settle_seconds=2.0),
+    Operation('awb', 'Auto White Balance toggle',
+              ws_param_type=20, test_value='0',
+              ws_state_key='autoWhiteBalance', settle_seconds=2.0),
+    Operation('wb_temp', 'AWB off → WB 2800K → WB 6500K → AWB on',
+              trigger_on=_awb_off_then_wb, trigger_off=_awb_restore_wb,
+              test_value='on', restore_value='off',
+              settle_seconds=2.0),
+    Operation('anti_flicker_50', 'Anti-flicker → 50Hz',
+              ws_param_type=27, test_value='1',
+              settle_seconds=1.5),
+    Operation('anti_flicker_60', 'Anti-flicker → 60Hz',
+              ws_param_type=27, test_value='2',
+              settle_seconds=1.5),
+    Operation('mirror', 'Mirror toggle',
+              ws_param_type=2, test_value='1',
+              ws_state_key='mirror', settle_seconds=2.0),
+    Operation('gesture_zoom', 'Gesture zoom toggle',
+              ws_param_type=39, test_value='1',
+              settle_seconds=2.0),
+    Operation('autofocus', 'Auto focus toggle',
+              ws_param_type=18, test_value='0',
+              settle_seconds=2.0),
+    Operation('smart_comp_on', 'Smart composition toggle',
+              ws_param_type=11, test_value='1',
+              ws_state_key='smartComposition', settle_seconds=2.0),
+    Operation('smart_comp_head', 'Smart comp framing → Head',
+              ws_param_type=10, test_value='1',
+              settle_seconds=2.0),
+    Operation('pan_right', 'Joystick pan right → center',
+              trigger_on=_joystick_pan_right, trigger_off=_center_reset,
+              test_value='on', restore_value='off',
+              settle_seconds=2.0),
+    Operation('pan_left', 'Joystick pan left → center',
+              trigger_on=_joystick_pan_left, trigger_off=_center_reset,
+              test_value='on', restore_value='off',
+              settle_seconds=2.0),
+    Operation('tilt_up', 'Joystick tilt up → center',
+              trigger_on=_joystick_tilt_up, trigger_off=_center_reset,
+              test_value='on', restore_value='off',
+              settle_seconds=2.0),
+    Operation('preset_recall', 'Save preset 19 → recall preset 0 → restore',
+              trigger_on=_preset_save_recall, trigger_off=_preset_restore,
+              test_value='on', restore_value='off',
+              settle_seconds=3.0),
+    Operation('camera_off', 'Camera preview off/on via desktop app GUI',
+              trigger_on=_camera_off, trigger_off=_camera_on,
+              test_value='off', restore_value='on',
+              settle_seconds=1.0),  # triggers have built-in waits
+]
+
+
+# ── uvc-probe server interface ───────────────────────────────────────────────
+
+PROBE_BIN = Path(__file__).resolve().parent / 'uvc-probe'
+
+
+@dataclass
+class XUEntry:
+    """A single XU register value."""
+    unit: int
+    sel: int
+    length: int
+    hex_data: str
+
+
+_SNAPSHOT_RE = re.compile(
+    r'unit=\s*(\d+)\s+sel=(0x[0-9a-fA-F]+)\s+len=(\d+)\s+hex=([0-9a-fA-F]+)')
+
+
+def parse_snapshot(text: str) -> list[XUEntry]:
+    """Parse uvc-probe snapshot output into XUEntry list."""
+    entries = []
+    for line in text.strip().splitlines():
+        m = _SNAPSHOT_RE.search(line)
+        if not m:
+            continue
+        entries.append(XUEntry(
+            unit=int(m.group(1)),
+            sel=int(m.group(2), 16),
+            length=int(m.group(3)),
+            hex_data=m.group(4)))
+    return entries
+
+
+def diff_snapshots(before: list[XUEntry], after: list[XUEntry]) -> list[dict]:
+    """Diff two snapshots, return list of changed entries."""
+    before_map = {(e.unit, e.sel): e for e in before}
+    after_map = {(e.unit, e.sel): e for e in after}
+
+    changes = []
+    for key in after_map:
+        if key in before_map and before_map[key].hex_data != after_map[key].hex_data:
+            b, a = before_map[key], after_map[key]
+            changes.append({
+                'unit': a.unit,
+                'sel': a.sel,
+                'sel_hex': f'0x{a.sel:02x}',
+                'len': a.length,
+                'before': b.hex_data,
+                'after': a.hex_data,
+            })
+    return changes
+
+
+class ProbeServer:
+    """Manages a `uvc-probe server` subprocess.
+
+    Sends a newline to trigger a snapshot, reads lines until "END",
+    parses the result into XUEntry list.
+    """
+
+    def __init__(self):
+        self.proc: subprocess.Popen | None = None
+
+    def start(self) -> None:
+        if not PROBE_BIN.exists():
+            raise FileNotFoundError(
+                f'{PROBE_BIN} not found. Compile with:\n'
+                f'  clang -o tools/uvc-probe tools/uvc-probe.m '
+                f'-framework IOKit -framework CoreFoundation -framework Foundation -ObjC')
+
+        log(f'Starting uvc-probe server: {PROBE_BIN} server')
+        self.proc = subprocess.Popen(
+            [str(PROBE_BIN), 'server'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        # Wait for "ready" message on stderr
+        # uvc-probe prints discovery info to stderr, then "server: ready (...)"
+        while True:
+            line = self.proc.stderr.readline().decode('utf-8', errors='replace')
+            if not line:
+                raise RuntimeError('uvc-probe server exited during startup')
+            log(f'  probe: {line.rstrip()}')
+            if 'ready' in line:
+                break
+
+    def snapshot(self) -> list[XUEntry]:
+        """Request a snapshot and parse the response."""
+        if not self.proc or self.proc.poll() is not None:
+            raise RuntimeError('uvc-probe server is not running')
+
+        self.proc.stdin.write(b'\n')
+        self.proc.stdin.flush()
+
+        lines = []
+        while True:
+            line = self.proc.stdout.readline().decode('utf-8', errors='replace')
+            if not line:
+                raise RuntimeError('uvc-probe server closed stdout unexpectedly')
+            if line.strip() == 'END':
+                break
+            lines.append(line)
+
+        return parse_snapshot('\n'.join(lines))
+
+    def stop(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            self.proc.stdin.close()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+            log('uvc-probe server stopped')
 
 
 # ── Desktop app management ───────────────────────────────────────────────────
@@ -458,7 +523,6 @@ APP_PATH_MACOS = '/Applications/Insta360 Link Controller.app'
 
 
 def is_app_running() -> bool:
-    """Check if the Insta360 Link Controller desktop app is running."""
     system = platform.system()
     if system == 'Darwin':
         try:
@@ -480,22 +544,19 @@ def is_app_running() -> bool:
 
 
 def launch_app() -> bool:
-    """Launch the desktop app. Returns True if launched (or already running)."""
     if is_app_running():
         log('Desktop app already running')
         return True
-
     system = platform.system()
     if system == 'Darwin':
         if os.path.exists(APP_PATH_MACOS):
             log(f'Launching {APP_NAME_MACOS}...')
             subprocess.Popen(['open', APP_PATH_MACOS])
-            # Wait for the app to start and WS server to come up
             for _ in range(30):
                 time.sleep(1)
                 if is_app_running():
                     log('Desktop app started')
-                    time.sleep(5)  # Extra time for WS server init
+                    time.sleep(5)
                     return True
             log('Desktop app did not start within 30s')
             return False
@@ -508,10 +569,8 @@ def launch_app() -> bool:
 
 
 def kill_app() -> bool:
-    """Kill the desktop app. Returns True if killed (or wasn't running)."""
     if not is_app_running():
         return True
-
     system = platform.system()
     if system == 'Darwin':
         try:
@@ -530,11 +589,20 @@ def kill_app() -> bool:
     return False
 
 
+# ── WebSocket helpers ────────────────────────────────────────────────────────
 
-# ── WebSocket trigger (Phase A) ──────────────────────────────────────────────
+async def ws_send_command(port: int, token: str, param_type: int, value: str) -> None:
+    from link_ctl import LinkClient, build_value_change
+    client = LinkClient(port, token=token)
+    await client.connect()
+    ok, _ = await client.handshake()
+    if ok:
+        await client.send_command(
+            build_value_change(client.serial, param_type, value), wait_ms=300)
+    await client.close()
+
 
 async def ws_get_status(port: int, token: str) -> dict | None:
-    """Read device state via WebSocket. Only call when browser/WS is free."""
     from link_ctl import LinkClient
     client = LinkClient(port, token=token)
     try:
@@ -548,20 +616,7 @@ async def ws_get_status(port: int, token: str) -> dict | None:
     return None
 
 
-async def ws_send_command(port: int, token: str, param_type: int, value: str) -> None:
-    """Send a single WS command."""
-    from link_ctl import LinkClient, build_value_change
-    client = LinkClient(port, token=token)
-    await client.connect()
-    ok, _ = await client.handshake()
-    if ok:
-        await client.send_command(
-            build_value_change(client.serial, param_type, value), wait_ms=300)
-    await client.close()
-
-
 async def discover_ws_connection() -> tuple[int, str] | None:
-    """Find the WebSocket port and token."""
     from link_ctl import _lsof_port, _read_token_from_ini
     port = _lsof_port()
     if not port:
@@ -571,317 +626,170 @@ async def discover_ws_connection() -> tuple[int, str] | None:
     return port, token
 
 
-# ── Phase A: Capture ─────────────────────────────────────────────────────────
+# ── Phase A: Capture via uvc-probe server ────────────────────────────────────
 
 @dataclass
-class CaptureEvent:
-    """A timestamped capture event."""
+class CaptureResult:
+    """Result of capturing one operation."""
     operation: str
-    action: str  # 'on' or 'off'
-    timestamp: float
-    ws_param_type: int = 0
-    ws_value: str = ''
-    expected_xu_selector: int = -1
+    description: str
+    ws_param_type: int
+    on_changes: list[dict] = field(default_factory=list)
+    off_changes: list[dict] = field(default_factory=list)
+    on_value: str = ''
+    off_value: str = ''
+    error: str = ''
 
 
-async def run_phase_a(operations: list[Operation], pcap_file: str) -> list[CaptureEvent]:
-    """Phase A: Trigger operations while tshark captures USB traffic.
-
-    Returns a list of timestamped events for correlation with the pcap.
-    """
-    sep('PHASE A: CAPTURE')
-    events: list[CaptureEvent] = []
-    cal = load_calibration()
-
-    # Find USB capture interface
-    iface = find_usb_capture_interface()
-    if not iface:
-        log('No USB capture interface found.')
-        log('macOS: sudo ifconfig XHC20 up')
-        log('Linux: sudo modprobe usbmon')
-        log('')
-        log('Alternatively, start a manual capture and use --pcap afterwards.')
-        return events
-
-    # Start capture
-    tshark_proc = start_tshark_capture(iface, pcap_file)
-    if not tshark_proc:
-        log('Failed to start tshark. Falling back to manual capture mode.')
-        log(f'Start your own capture, then use: --pcap <file>')
-        return events
+async def run_phase_a(operations: list[Operation],
+                      settle_override: float | None = None) -> list[CaptureResult]:
+    """Phase A: For each operation, snapshot XU state before/after via uvc-probe server."""
+    sep('PHASE A: CAPTURE (uvc-probe server)')
+    results: list[CaptureResult] = []
 
     # Ensure desktop app is running
-    if not launch_app():
-        stop_tshark(tshark_proc)
-        log('Cannot proceed without the desktop app running.')
-        return events
+    if not is_app_running():
+        if not launch_app():
+            log('Cannot proceed without the desktop app running.')
+            return results
 
     # Discover WS connection
     ws_info = await discover_ws_connection()
     if not ws_info:
-        stop_tshark(tshark_proc)
-        return events
+        return results
     port, token = ws_info
+    log(f'WebSocket: port={port}, token={"*" * len(token) if token else "(none)"}')
 
-    # Read baseline state
-    log('Reading baseline state...')
-    baseline = await ws_get_status(port, token)
-    if baseline:
-        log(f'  Baseline: mode={baseline.get("mode")}, hdr={baseline.get("hdr")}, '
-            f'brightness={baseline.get("brightness")}')
+    # Read baseline WS state (used to pick test/restore values)
+    device_state = await ws_get_status(port, token)
+    if device_state:
+        log(f'Baseline WS state: mode={device_state.get("mode")}, '
+            f'hdr={device_state.get("hdr")}, brightness={device_state.get("brightness")}, '
+            f'zoom={device_state.get("zoom")}')
     else:
-        log('  Warning: could not read baseline state')
+        log('WARNING: Could not read device state — will use default test/restore values')
 
-    # Execute each operation
-    for op in operations:
-        sep(f'CAPTURE: {op.name} — {op.description}')
-
-        if op.trigger == 'ws':
-            # ON
-            t_on = time.time()
-            log(f'  → ON: paramType={op.ws_param_type}, value={op.ws_on_value!r}')
-            try:
-                await ws_send_command(port, token, op.ws_param_type, op.ws_on_value)
-            except Exception as e:
-                log(f'  WS error: {e}')
-                continue
-            events.append(CaptureEvent(
-                operation=op.name, action='on', timestamp=t_on,
-                ws_param_type=op.ws_param_type, ws_value=op.ws_on_value,
-                expected_xu_selector=op.expected_xu_selector))
-
-            await asyncio.sleep(op.settle_seconds)
-
-            # OFF / RESET
-            t_off = time.time()
-            log(f'  → OFF: paramType={op.ws_param_type}, value={op.ws_off_value!r}')
-            try:
-                await ws_send_command(port, token, op.ws_param_type, op.ws_off_value)
-            except Exception as e:
-                log(f'  WS error: {e}')
-                continue
-            events.append(CaptureEvent(
-                operation=op.name, action='off', timestamp=t_off,
-                ws_param_type=op.ws_param_type, ws_value=op.ws_off_value,
-                expected_xu_selector=op.expected_xu_selector))
-
-            await asyncio.sleep(1.0)
-
-        elif op.trigger == 'applescript':
-            if platform.system() != 'Darwin':
-                log(f'  SKIP: AppleScript only available on macOS')
-                continue
-
-            # ON
-            t_on = time.time()
-            log(f'  → Privacy ON via AppleScript')
-            applescript_privacy_toggle(cal, 'on')
-            events.append(CaptureEvent(
-                operation=op.name, action='on', timestamp=t_on,
-                expected_xu_selector=op.expected_xu_selector))
-
-            await asyncio.sleep(op.settle_seconds)
-
-            # OFF
-            t_off = time.time()
-            log(f'  → Privacy OFF via AppleScript')
-            applescript_privacy_toggle(cal, 'off')
-            events.append(CaptureEvent(
-                operation=op.name, action='off', timestamp=t_off,
-                expected_xu_selector=op.expected_xu_selector))
-
-            await asyncio.sleep(2.0)
-
-    # Stop capture
-    stop_tshark(tshark_proc)
-
-    # Save event log
-    event_log = Path(pcap_file).with_suffix('.events.json')
-    event_data = [{
-        'operation': e.operation, 'action': e.action,
-        'timestamp': e.timestamp, 'ws_param_type': e.ws_param_type,
-        'ws_value': e.ws_value, 'expected_xu_selector': e.expected_xu_selector,
-    } for e in events]
-    event_log.write_text(json.dumps(event_data, indent=2))
-    log(f'Event log: {event_log}')
-    log(f'Pcap file: {pcap_file}')
-    log(f'Total events captured: {len(events)}')
-
-    return events
-
-
-# ── pcap analysis ────────────────────────────────────────────────────────────
-
-@dataclass
-class USBControlTransfer:
-    """A parsed USB control transfer from tshark output."""
-    timestamp: float
-    direction: str          # 'OUT' (host→device) or 'IN' (device→host)
-    bm_request_type: int
-    b_request: int          # 0x01=SET_CUR, 0x81=GET_CUR, etc.
-    w_value: int            # (selector << 8) for XU controls
-    w_index: int            # (unit_id << 8 | interface) for XU controls
-    data: bytes
-    xu_selector: int = 0    # Decoded: w_value >> 8
-    xu_unit_id: int = 0     # Decoded: w_index >> 8
-
-
-def parse_pcap(pcap_file: str) -> list[USBControlTransfer]:
-    """Parse a pcap file for USB control transfers using tshark.
-
-    Extracts UVC class-specific control transfers (bmRequestType 0x21 or 0xA1)
-    which are how XU GET/SET commands travel over USB.
-    """
-    if not os.path.exists(pcap_file):
-        log(f'Pcap file not found: {pcap_file}')
-        return []
-
-    if not check_tshark():
-        log('tshark not found — cannot parse pcap')
-        return []
-
-    # Extract USB control transfer fields
-    cmd = [
-        'tshark', '-r', pcap_file,
-        '-Y', 'usb.transfer_type == 0x02',  # URB_CONTROL
-        '-T', 'fields',
-        '-e', 'frame.time_epoch',
-        '-e', 'usb.endpoint_address.direction',
-        '-e', 'usb.setup.bmRequestType',
-        '-e', 'usb.setup.bRequest',
-        '-e', 'usb.setup.wValue',
-        '-e', 'usb.setup.wIndex',
-        '-e', 'usb.data_fragment',
-        '-E', 'header=n',
-        '-E', 'separator=|',
-    ]
-
+    # Start uvc-probe server
+    probe = ProbeServer()
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        log(f'tshark parse error: {e}')
-        return []
+        probe.start()
+    except (FileNotFoundError, RuntimeError) as e:
+        log(f'Failed to start uvc-probe server: {e}')
+        return results
 
-    transfers = []
-    for line in out.stdout.strip().splitlines():
-        parts = line.split('|')
-        if len(parts) < 6:
-            continue
+    # Take initial baseline snapshot
+    baseline_snap = probe.snapshot()
+    log(f'Baseline: {len(baseline_snap)} XU registers')
+
+    for op in operations:
+        settle = settle_override if settle_override is not None else op.settle_seconds
+        test_val, restore_val = op.pick_values(device_state)
+
+        sep(f'CAPTURE: {op.name} — {op.description}')
+        log(f'  test={test_val!r}, restore={restore_val!r} '
+            f'(paramType={op.ws_param_type})')
+
+        result = CaptureResult(
+            operation=op.name, description=op.description,
+            ws_param_type=op.ws_param_type,
+            on_value=test_val, off_value=restore_val)
+
         try:
-            ts_str, direction, bm_req, b_req, w_val, w_idx = parts[:6]
-            data_hex = parts[6] if len(parts) > 6 else ''
+            # Step 1: Snapshot → SET test value → Snapshot → diff
+            before = probe.snapshot()
+            if op.is_custom:
+                log(f'  → SET: {op.name} (custom trigger)')
+                await op.trigger_on(port, token)
+            else:
+                log(f'  → SET: paramType={op.ws_param_type}, value={test_val!r}')
+                await ws_send_command(port, token, op.ws_param_type, test_val)
+            await asyncio.sleep(settle)
+            after = probe.snapshot()
 
-            timestamp = float(ts_str) if ts_str else 0.0
-            bm_request_type = int(bm_req, 16) if bm_req else 0
-            b_request = int(b_req, 16) if b_req else 0
-            w_value = int(w_val, 16) if w_val else 0
-            w_index = int(w_idx, 16) if w_idx else 0
-            data = bytes.fromhex(data_hex.replace(':', '')) if data_hex else b''
+            changes = diff_snapshots(before, after)
+            result.on_changes = changes
+            if changes:
+                for c in changes:
+                    log(f'    CHANGED unit={c["unit"]:2d} sel={c["sel_hex"]} '
+                        f'{c["before"]} → {c["after"]}')
+            else:
+                log(f'    (no XU register changes detected)')
 
-            # Filter for UVC class-specific requests (0x21=SET, 0xA1=GET)
-            if bm_request_type not in (0x21, 0xA1):
-                continue
+            # Step 2: Snapshot → RESTORE original value → Snapshot → diff
+            before2 = probe.snapshot()
+            if op.is_custom:
+                log(f'  → RESTORE: {op.name} (custom trigger)')
+                await op.trigger_off(port, token)
+            else:
+                log(f'  → RESTORE: paramType={op.ws_param_type}, value={restore_val!r}')
+                await ws_send_command(port, token, op.ws_param_type, restore_val)
+            await asyncio.sleep(settle)
+            after2 = probe.snapshot()
 
-            xfer = USBControlTransfer(
-                timestamp=timestamp,
-                direction='OUT' if bm_request_type == 0x21 else 'IN',
-                bm_request_type=bm_request_type,
-                b_request=b_request,
-                w_value=w_value,
-                w_index=w_index,
-                data=data,
-                xu_selector=w_value >> 8,
-                xu_unit_id=w_index >> 8,
-            )
-            transfers.append(xfer)
-        except (ValueError, IndexError):
-            continue
+            changes2 = diff_snapshots(before2, after2)
+            result.off_changes = changes2
+            if changes2:
+                for c in changes2:
+                    log(f'    CHANGED unit={c["unit"]:2d} sel={c["sel_hex"]} '
+                        f'{c["before"]} → {c["after"]}')
+            else:
+                log(f'    (no XU register changes detected)')
 
-    log(f'Parsed {len(transfers)} UVC class-specific control transfers from {pcap_file}')
-    return transfers
+            # Brief pause between operations
+            await asyncio.sleep(0.5)
 
+        except Exception as e:
+            result.error = str(e)
+            log(f'    ERROR: {e}')
 
-def correlate_events(events: list[CaptureEvent],
-                     transfers: list[USBControlTransfer],
-                     window_ms: float = 500) -> dict:
-    """Correlate capture events with USB transfers by timestamp.
+        results.append(result)
 
-    For each event, find USB control transfers that occurred within
-    window_ms milliseconds after the event timestamp.
+    probe.stop()
 
-    Returns: {operation_name: {action: [transfers]}}
-    """
-    result = {}
-    window_s = window_ms / 1000.0
+    # Summary
+    sep('CAPTURE SUMMARY')
+    for r in results:
+        on_n = len(r.on_changes)
+        off_n = len(r.off_changes)
+        status = 'ERROR' if r.error else f'{on_n} on / {off_n} off changes'
+        log(f'  {r.operation:20s}  {status}')
 
-    for event in events:
-        key = event.operation
-        if key not in result:
-            result[key] = {'on': [], 'off': []}
-
-        matching = []
-        for xfer in transfers:
-            dt = xfer.timestamp - event.timestamp
-            if 0 <= dt <= window_s:
-                matching.append({
-                    'delta_ms': round(dt * 1000, 1),
-                    'direction': xfer.direction,
-                    'request': UVC_REQ_NAMES.get(xfer.b_request, f'0x{xfer.b_request:02x}'),
-                    'xu_selector': xfer.xu_selector,
-                    'xu_unit_id': xfer.xu_unit_id,
-                    'data': xfer.data.hex() if xfer.data else '',
-                    'w_value': f'0x{xfer.w_value:04x}',
-                    'w_index': f'0x{xfer.w_index:04x}',
-                })
-
-        result[key][event.action] = matching
-        if matching:
-            log(f'  {key}/{event.action}: {len(matching)} USB transfers within {window_ms}ms')
-        else:
-            log(f'  {key}/{event.action}: no USB transfers found within {window_ms}ms')
-
-    return result
-
+    return results
 
 
 # ── Phase B: Replay ──────────────────────────────────────────────────────────
 
-async def run_phase_b(correlation: dict, report_file: str) -> list[dict]:
-    """Phase B: Replay captured XU commands directly, then validate via WS.
-
-    1. Kill the desktop app
-    2. Send each captured XU SET_CUR command directly via link_usb
-    3. Restart the desktop app
-    4. Read state via WS and compare to expected
-    """
+async def run_phase_b(results: list[CaptureResult]) -> list[dict]:
+    """Phase B: Replay captured XU SET_CUR commands directly, then validate via WS."""
     sep('PHASE B: REPLAY')
-    results = []
+    replay_results = []
 
-    # Extract SET_CUR commands from correlation data
+    # Collect unique SET_CUR-equivalent commands from on_changes
+    # (the "on" changes show what bytes to write to activate a feature)
     set_commands = []
-    for op_name, actions in correlation.items():
-        for action in ['on', 'off']:
-            for xfer in actions.get(action, []):
-                if xfer.get('request') == 'SET_CUR' and xfer.get('data'):
-                    set_commands.append({
-                        'operation': op_name,
-                        'action': action,
-                        'xu_selector': xfer['xu_selector'],
-                        'xu_unit_id': xfer['xu_unit_id'],
-                        'data': xfer['data'],
-                    })
+    for r in results:
+        if r.error:
+            continue
+        for change in r.on_changes:
+            set_commands.append({
+                'operation': r.operation,
+                'action': 'on',
+                'xu_unit': change['unit'],
+                'xu_selector': change['sel'],
+                'data_hex': change['after'],
+                'before_hex': change['before'],
+            })
 
     if not set_commands:
-        log('No SET_CUR commands found in correlation data. Cannot replay.')
-        return results
+        log('No XU changes captured. Nothing to replay.')
+        return replay_results
 
-    log(f'Found {len(set_commands)} SET_CUR commands to replay')
+    log(f'Found {len(set_commands)} XU register changes to replay')
 
-    # Kill desktop app
+    # Kill desktop app for direct USB access
     log('Stopping desktop app for direct USB replay...')
     if not kill_app():
         log('WARNING: Could not stop desktop app. Replay may conflict.')
-
     time.sleep(3)
 
     # Open USB backend
@@ -889,7 +797,7 @@ async def run_phase_b(correlation: dict, report_file: str) -> list[dict]:
     if not device:
         log('No camera found for USB replay.')
         launch_app()
-        return results
+        return replay_results
 
     backend = get_xu_backend()
     try:
@@ -897,24 +805,25 @@ async def run_phase_b(correlation: dict, report_file: str) -> list[dict]:
     except RuntimeError as e:
         log(f'Failed to open USB device: {e}')
         launch_app()
-        return results
+        return replay_results
 
     # Replay each command
     for cmd in set_commands:
         sel = cmd['xu_selector']
-        data = bytes.fromhex(cmd['data'])
+        unit = cmd['xu_unit']
+        data = bytes.fromhex(cmd['data_hex'])
         sel_name = XU_SELECTOR_NAMES.get(sel, f'UNKNOWN_{sel}')
 
-        log(f'  REPLAY: {cmd["operation"]}/{cmd["action"]} → '
-            f'XU SET_CUR sel={sel} ({sel_name}) data={cmd["data"][:40]}...')
+        log(f'  REPLAY: {cmd["operation"]}/on → '
+            f'unit={unit} sel={sel} ({sel_name}) data={cmd["data_hex"][:40]}')
         try:
-            backend.xu_set(cmd['xu_unit_id'], sel, data)
-            log(f'    ✓ Sent successfully')
+            backend.xu_set(unit, sel, data)
+            log(f'    sent OK')
             cmd['replay_success'] = True
         except OSError as e:
-            log(f'    ✗ Failed: {e}')
+            log(f'    FAILED: {e}')
             cmd['replay_success'] = False
-        results.append(cmd)
+        replay_results.append(cmd)
         time.sleep(0.5)
 
     backend.close()
@@ -932,21 +841,22 @@ async def run_phase_b(correlation: dict, report_file: str) -> list[dict]:
         if state:
             log(f'  Post-replay state: mode={state.get("mode")}, '
                 f'hdr={state.get("hdr")}, brightness={state.get("brightness")}')
-            for r in results:
+            for r in replay_results:
                 r['post_state'] = state
         else:
             log('  Could not read state after replay')
     else:
         log('  Could not connect to WS for validation')
 
-    return results
+    return replay_results
 
 
 # ── Phase C: Report ──────────────────────────────────────────────────────────
 
-def generate_report(events: list[CaptureEvent], correlation: dict,
-                    replay_results: list[dict], report_file: str) -> None:
-    """Generate final JSON report with validated command mappings."""
+def generate_report(results: list[CaptureResult],
+                    replay_results: list[dict],
+                    report_file: str) -> None:
+    """Generate final JSON report with command mappings."""
     sep('PHASE C: REPORT')
 
     report = {
@@ -955,167 +865,151 @@ def generate_report(events: list[CaptureEvent], correlation: dict,
         'operations': {},
     }
 
-    for op_name, actions in correlation.items():
-        op_report = {'actions': {}}
-        for action in ['on', 'off']:
-            transfers = actions.get(action, [])
-            set_curs = [t for t in transfers if t.get('request') == 'SET_CUR']
-            get_curs = [t for t in transfers if t.get('request') == 'GET_CUR']
-            op_report['actions'][action] = {
-                'set_cur_commands': set_curs,
-                'get_cur_commands': get_curs,
-                'total_usb_transfers': len(transfers),
-            }
+    for r in results:
+        op_report = {
+            'ws_param_type': r.ws_param_type,
+            'description': r.description,
+            'on_value': r.on_value,
+            'off_value': r.off_value,
+            'on_changes': r.on_changes,
+            'off_changes': r.off_changes,
+            'error': r.error or None,
+        }
 
         # Find corresponding replay results
-        replays = [r for r in replay_results if r.get('operation') == op_name]
+        replays = [rr for rr in replay_results if rr.get('operation') == r.operation]
         op_report['replay_results'] = replays
-        op_report['validated'] = any(r.get('replay_success') for r in replays)
+        op_report['validated'] = any(rr.get('replay_success') for rr in replays)
 
-        report['operations'][op_name] = op_report
+        report['operations'][r.operation] = op_report
 
-    # Write report
     Path(report_file).write_text(json.dumps(report, indent=2, default=str))
     log(f'Report written: {report_file}')
 
-    # Summary
+    # Summary table
     validated = sum(1 for op in report['operations'].values() if op.get('validated'))
     total = len(report['operations'])
-    log(f'\n  Operations captured: {total}')
-    log(f'  Validated (replay succeeded): {validated}')
-    log(f'  Not validated: {total - validated}')
+    has_changes = sum(1 for op in report['operations'].values()
+                      if op.get('on_changes') or op.get('off_changes'))
+
+    log(f'\n  Operations tested:  {total}')
+    log(f'  With XU changes:   {has_changes}')
+    log(f'  Replay validated:  {validated}')
 
     # Print the command map
-    if any(report['operations'].values()):
-        print(f'\n── Discovered XU Command Map ──')
-        for op_name, op_data in report['operations'].items():
-            for action, action_data in op_data.get('actions', {}).items():
-                for cmd in action_data.get('set_cur_commands', []):
-                    sel = cmd.get('xu_selector', '?')
-                    sel_name = XU_SELECTOR_NAMES.get(sel, f'?') if isinstance(sel, int) else '?'
-                    data = cmd.get('data', '')
-                    validated = '✓' if op_data.get('validated') else '?'
-                    print(f'  {validated} {op_name}/{action}: '
-                          f'XU sel={sel} ({sel_name}) data={data[:32]}{"..." if len(data) > 32 else ""}')
+    print(f'\n── Discovered XU Command Map ──')
+    for op_name, op_data in report['operations'].items():
+        validated_mark = 'V' if op_data.get('validated') else '?'
+        for change in op_data.get('on_changes', []):
+            sel_name = XU_SELECTOR_NAMES.get(change['sel'], '?')
+            print(f'  [{validated_mark}] {op_name:20s}  '
+                  f'unit={change["unit"]:2d} sel={change["sel_hex"]} ({sel_name:20s})  '
+                  f'{change["before"]} → {change["after"]}')
+        if not op_data.get('on_changes') and not op_data.get('error'):
+            print(f'  [ ] {op_name:20s}  (no XU changes detected)')
+        if op_data.get('error'):
+            print(f'  [E] {op_name:20s}  ERROR: {op_data["error"]}')
 
 
 # ── Dry-run mode ─────────────────────────────────────────────────────────────
 
-def dry_run():
-    """Print what would be captured without doing anything."""
+def dry_run(operations: list[Operation]):
     sep('DRY RUN')
-    print('Phase A would trigger these operations while capturing USB traffic:\n')
+    print('Phase A will trigger these operations while reading XU state via uvc-probe:\n')
 
-    print('WebSocket-triggered operations (via existing link_ctl API):')
-    for op in WS_OPERATIONS:
-        sel = f'XU sel≈{op.expected_xu_selector}' if op.expected_xu_selector >= 0 else 'XU sel=?'
-        print(f'  {op.name:20s}  paramType={op.ws_param_type:2d}  '
-              f'{op.ws_on_value!r:>5s} → {op.ws_off_value!r:<5s}  ({sel})')
+    total_time = 0.0
+    for op in operations:
+        if op.is_custom:
+            print(f'  {op.name:20s}  (custom trigger)  settle={op.settle_seconds}s')
+        else:
+            print(f'  {op.name:20s}  paramType={op.ws_param_type:2d}  '
+                  f'test={op.test_value!r:>6s}  state_key={op.ws_state_key or "(none)":20s}  '
+                  f'settle={op.settle_seconds}s')
+        total_time += op.settle_seconds * 2 + 1.0
 
-    print(f'\nAppleScript-triggered operations (GUI-only):')
-    for op in APPLESCRIPT_OPERATIONS:
-        sel = f'XU sel≈{op.expected_xu_selector}' if op.expected_xu_selector >= 0 else 'XU sel=?'
-        print(f'  {op.name:20s}  (GUI click)  ({sel})')
+    print(f'\nTotal operations: {len(operations)}')
+    print(f'Estimated capture time: ~{total_time:.0f}s')
 
-    print(f'\nTotal operations: {len(ALL_OPERATIONS)}')
-    print(f'Estimated capture time: ~{sum(op.settle_seconds * 2 + 2 for op in ALL_OPERATIONS):.0f}s')
+    print(f'\nRequirements:')
+    print(f'  - tools/uvc-probe compiled: {"YES" if PROBE_BIN.exists() else "NO — compile first"}')
+    print(f'  - Desktop app running:      {"YES" if is_app_running() else "NO — start it first"}')
+    print(f'  - sudo access:              required for uvc-probe')
 
-    print(f'\nPhase B would:')
+    print(f'\nPhase B will:')
     print(f'  1. Kill the desktop app')
-    print(f'  2. Replay each captured XU SET_CUR command via direct USB')
+    print(f'  2. Replay each XU SET_CUR command via direct USB (link_usb)')
     print(f'  3. Restart the desktop app')
     print(f'  4. Read state via WebSocket and validate')
-
-    print(f'\nPhase C would generate a JSON report with validated command mappings.')
-
-    cal = load_calibration()
-    privacy = cal.get('privacy_button', {})
-    if privacy.get('x') is None:
-        print(f'\n⚠  Privacy button not calibrated.')
-        print(f'   Run: python tools/xu_capture.py --calibrate')
-    else:
-        print(f'\n✓  Privacy button calibrated at ({privacy["x"]}, {privacy["y"]})')
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 async def async_main(args):
     timestamp = time.strftime('%Y%m%d-%H%M%S')
-    pcap_file = args.pcap or f'xu_capture_{timestamp}.pcapng'
     report_file = args.report or f'xu_capture_report_{timestamp}.json'
 
+    # Filter operations if --only specified
+    operations = OPERATIONS
+    if args.only:
+        names = {n.strip() for n in args.only.split(',')}
+        operations = [op for op in OPERATIONS if op.name in names]
+        unknown = names - {op.name for op in operations}
+        if unknown:
+            log(f'Unknown operations: {", ".join(sorted(unknown))}')
+            log(f'Available: {", ".join(op.name for op in OPERATIONS)}')
+            return
+        if not operations:
+            log('No matching operations found.')
+            return
+
     if args.dry_run:
-        dry_run()
+        dry_run(operations)
         return
 
-    if args.calibrate:
-        run_calibrate()
+    # Phase A: Capture
+    results = await run_phase_a(operations, settle_override=args.settle)
+    if not results:
+        log('No results captured. Check the setup and try again.')
         return
 
-    if args.pcap and os.path.exists(args.pcap):
-        # Analyze existing pcap (skip Phase A)
-        sep('ANALYZING EXISTING PCAP')
-        events_file = Path(args.pcap).with_suffix('.events.json')
-        if events_file.exists():
-            events_data = json.loads(events_file.read_text())
-            events = [CaptureEvent(**e) for e in events_data]
-            log(f'Loaded {len(events)} events from {events_file}')
-        else:
-            log(f'No event log found at {events_file}')
-            log('Cannot correlate without timestamps. Run a full capture first.')
-            return
-
-        transfers = parse_pcap(args.pcap)
-    else:
-        # Full Phase A capture
-        events = await run_phase_a(ALL_OPERATIONS, pcap_file)
-        if not events:
-            log('No events captured. Check the setup and try again.')
-            return
-        transfers = parse_pcap(pcap_file)
-
-    if not transfers:
-        log('No USB control transfers found in capture.')
-        log('Possible causes:')
-        log('  - USB capture interface not active (sudo ifconfig XHC20 up)')
-        log('  - Camera on a different USB bus')
-        log('  - SIP preventing USB capture on macOS')
-        return
-
-    # Correlate events with USB transfers
-    sep('CORRELATING EVENTS WITH USB TRANSFERS')
-    correlation = correlate_events(events, transfers)
+    # Save capture results immediately
+    capture_file = Path(report_file).with_suffix('.capture.json')
+    capture_data = []
+    for r in results:
+        capture_data.append({
+            'operation': r.operation, 'description': r.description,
+            'ws_param_type': r.ws_param_type,
+            'on_value': r.on_value, 'off_value': r.off_value,
+            'on_changes': r.on_changes, 'off_changes': r.off_changes,
+            'error': r.error or None,
+        })
+    capture_file.write_text(json.dumps(capture_data, indent=2))
+    log(f'Capture data saved: {capture_file}')
 
     if not args.capture_only:
         # Phase B: Replay
-        replay_results = await run_phase_b(correlation, report_file)
-
+        replay_results = await run_phase_b(results)
         # Phase C: Report
-        generate_report(events, correlation, replay_results, report_file)
+        generate_report(results, replay_results, report_file)
     else:
-        # Save correlation without replay
-        correlation_file = Path(pcap_file).with_suffix('.correlation.json')
-        correlation_file.write_text(json.dumps(correlation, indent=2, default=str))
-        log(f'Correlation saved: {correlation_file}')
-        log('Phase B (replay) skipped. Use --replay to replay later.')
+        generate_report(results, [], report_file)
+        log('Phase B (replay) skipped.')
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Synthetic USB capture, replay, and validation harness.',
+        description='Automated XU control discovery via uvc-probe + WebSocket.',
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--dry-run', action='store_true',
                         help='Show planned operations without doing anything')
-    parser.add_argument('--calibrate', action='store_true',
-                        help='Calibrate AppleScript button positions')
-    parser.add_argument('--pcap', type=str, default=None,
-                        help='Analyze existing pcap file (skip capture)')
     parser.add_argument('--capture-only', action='store_true',
                         help='Run only Phase A (capture); skip replay and validation')
     parser.add_argument('--report', type=str, default=None,
                         help='Output report file path')
-    parser.add_argument('--replay', type=str, default=None,
-                        help='Replay from a previous report JSON (Phase B only)')
+    parser.add_argument('--only', type=str, default=None,
+                        help='Comma-separated list of operation names to run')
+    parser.add_argument('--settle', type=float, default=None,
+                        help='Override settle time (seconds) for all operations')
     args = parser.parse_args()
 
     asyncio.run(async_main(args))

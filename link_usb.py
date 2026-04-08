@@ -501,11 +501,9 @@ class MacOSXUBackend(XUBackend):
         if ret < 0:
             raise RuntimeError(f'uvc_init failed: {ret}')
 
-        # Find Insta360 Link device
-        # VID:PID unknown — search by name (vid=0, pid=0 means any device)
-        # We try finding any device first, then filter by name if needed
+        # Find Insta360 Link device by VID:PID
         ret = self._lib.uvc_find_device(
-            self._ctx, ctypes.byref(self._dev), 0, 0, None)
+            self._ctx, ctypes.byref(self._dev), 0x2E1A, 0x4C01, None)
         if ret < 0:
             self._lib.uvc_exit(self._ctx)
             raise RuntimeError(
@@ -564,18 +562,6 @@ class MacOSXUBackend(XUBackend):
         if ret < 0:
             raise OSError(f'uvc_set_ctrl failed: {ret} '
                           f'(unit={unit}, sel={selector}, size={size})')
-
-
-def _find_macos_camera() -> bool:
-    """Check if an Insta360 Link is connected on macOS."""
-    try:
-        out = subprocess.run(
-            ['ioreg', '-p', 'IOUSB', '-w', '0'],
-            capture_output=True, text=True, timeout=5)
-        return 'insta360' in out.stdout.lower()
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
-
 
 
 # ── Windows backend (stub) ───────────────────────────────────────────────────
@@ -744,7 +730,13 @@ def _find_windows_device_info() -> DeviceInfo | None:
 
 # Default Extension Unit ID — will be discovered by xu_discover.py.
 # This is a placeholder; the real value comes from the USB descriptor.
-DEFAULT_XU_UNIT_ID = 3  # Common default for UVC extension units
+# UVC unit IDs for the Insta360 Link (discovered via uvc-probe)
+UNIT_CT  = 1   # Camera Terminal — autofocus, zoom
+UNIT_PU  = 5   # Processing Unit — brightness, contrast, saturation, sharpness, AWB, anti-flicker
+UNIT_XU1 = 9   # Extension Unit 1 — AI mode, func-enable bitmask, exposure, pan/tilt, tracking
+UNIT_XU2 = 10  # Extension Unit 2 — privacy (physical tilt)
+
+DEFAULT_XU_UNIT_ID = UNIT_XU1
 
 
 class LinkUSB:
@@ -811,162 +803,292 @@ class LinkUSB:
         return controls
 
     # ── High-level commands ──────────────────────────────────────────────────
-    # Data formats are STUBS — they need to be populated from USB captures.
-    # Each method documents the expected XU selector and what xu_capture.py
-    # needs to fill in.
+    # Data formats confirmed via xu_capture.py Phase A (uvc-probe server).
+    # Controls are spread across multiple UVC units:
+    #   Unit 1 (CT)  — autofocus, zoom
+    #   Unit 5 (PU)  — brightness, contrast, saturation, sharpness, AWB, anti-flicker
+    #   Unit 9 (XU1) — AI mode, func-enable bitmask, exposure, pan/tilt
+    #   Unit 10 (XU2) — privacy
+
+    def _xu_get(self, unit: int, selector: int, size: int) -> bytes:
+        return self.backend.xu_get(unit, selector, size)
+
+    def _xu_set(self, unit: int, selector: int, data: bytes) -> None:
+        self.backend.xu_set(unit, selector, data)
+
+    # ── Func-enable bitmask (unit 9, sel 0x1b) ─────────────────────────────
+    # 2-byte LE bitmask controlling multiple features:
+    #   bit 2 (0x0004) = HDR
+    #   bit 3 (0x0008) = mirror/horizontal flip
+    #   bit 4 (0x0010) = gesture zoom
+    #   bit 11 (0x0800) = privacy (physical tilt)
+
+    def _read_func_enable(self) -> int:
+        """Read the current func-enable bitmask (unit 9, sel 0x1b, 2 bytes LE)."""
+        data = self._xu_get(UNIT_XU1, 0x1b, 2)
+        return int.from_bytes(data, 'little')
+
+    def _write_func_enable(self, value: int) -> None:
+        """Write the func-enable bitmask."""
+        self._xu_set(UNIT_XU1, 0x1b, value.to_bytes(2, 'little'))
+
+    def _set_func_bit(self, bit: int, on: bool) -> None:
+        """Set or clear a single bit in the func-enable bitmask."""
+        cur = self._read_func_enable()
+        if on:
+            cur |= (1 << bit)
+        else:
+            cur &= ~(1 << bit)
+        self._write_func_enable(cur)
+
+    # ── Queries ─────────────────────────────────────────────────────────────
 
     def get_device_info(self) -> bytes:
-        """Read device info via XU_DEVICE_INFO_CONTROL (selector 3).
-
-        Returns raw bytes; format TBD from USB capture.
-        """
-        length = self.backend.xu_get_len(self.unit_id, XU_DEVICE_INFO_CONTROL)
+        """Read device info (unit 9, sel 0x03)."""
+        length = self.backend.xu_get_len(UNIT_XU1, XU_DEVICE_INFO_CONTROL)
         if length == 0:
-            raise RuntimeError('XU_DEVICE_INFO_CONTROL not supported or zero length')
-        return self.xu_get_raw(XU_DEVICE_INFO_CONTROL, length)
+            raise RuntimeError('XU_DEVICE_INFO_CONTROL not supported')
+        return self._xu_get(UNIT_XU1, XU_DEVICE_INFO_CONTROL, length)
 
     def get_device_status(self) -> bytes:
-        """Read device status via XU_DEVICE_STATUS_CONTROL (selector 11)."""
-        length = self.backend.xu_get_len(self.unit_id, XU_DEVICE_STATUS_CONTROL)
-        if length == 0:
-            raise RuntimeError('XU_DEVICE_STATUS_CONTROL not supported')
-        return self.xu_get_raw(XU_DEVICE_STATUS_CONTROL, length)
+        """Read device status (unit 9, sel 0x0b, 5 bytes)."""
+        return self._xu_get(UNIT_XU1, 0x0b, 5)
 
     def get_serial_number(self) -> bytes:
-        """Read serial number via XU_DEVICE_SN_CONTROL (selector 12)."""
-        length = self.backend.xu_get_len(self.unit_id, XU_DEVICE_SN_CONTROL)
+        """Read serial number (unit 9, sel 0x0c)."""
+        length = self.backend.xu_get_len(UNIT_XU1, XU_DEVICE_SN_CONTROL)
         if length == 0:
             raise RuntimeError('XU_DEVICE_SN_CONTROL not supported')
-        return self.xu_get_raw(XU_DEVICE_SN_CONTROL, length)
+        return self._xu_get(UNIT_XU1, XU_DEVICE_SN_CONTROL, length)
 
-    def set_privacy(self, on: bool) -> None:
-        """Toggle privacy mode (sensor disable) via XU_FUNC_ENABLE_CONTROL (27).
-
-        STUB: The actual data format is unknown.  xu_capture.py will determine
-        the correct bytes by capturing the desktop app toggling privacy mode
-        via AppleScript.
-
-        Best guess: a single byte or int32 flag (0=off, 1=on), but this MUST
-        be confirmed from a USB capture before use.
-        """
-        # TODO: Replace with actual data format from xu_capture.py
-        raise NotImplementedError(
-            'Privacy mode data format unknown.\n'
-            'Run tools/xu_capture.py to capture the desktop app toggling privacy,\n'
-            'then update this method with the discovered XU data bytes.')
+    # ── AI mode (unit 9, sel 0x02) ──────────────────────────────────────────
+    # Confirmed: 1-byte value.
+    #   0=normal, 1=tracking, 4=overhead, 5=deskview, 6=whiteboard
 
     def set_video_mode(self, mode: int) -> None:
-        """Set AI mode via XU_VIDEO_MODE_CONTROL (selector 2).
+        """Set AI mode. 0=normal, 1=tracking, 4=overhead, 5=deskview, 6=whiteboard."""
+        if mode not in (0, 1, 4, 5, 6):
+            raise ValueError(f'Invalid mode {mode}: must be 0, 1, 4, 5, or 6')
+        self._xu_set(UNIT_XU1, 0x02, bytes([mode]))
 
-        Mode values (from proto VideoModeType enum):
-          0 = Normal, 1 = Auto Composition, 2 = Tracking,
-          4 = Whiteboard, 5 = Overhead, 6 = DeskView
+    def get_video_mode(self) -> int:
+        """Read current AI mode."""
+        return self._xu_get(UNIT_XU1, 0x02, 1)[0]
 
-        STUB: Data format unknown — likely a single int32 or byte.
-        """
-        raise NotImplementedError(
-            'Video mode XU data format unknown.\n'
-            'Run tools/xu_capture.py to discover the correct bytes.')
-
-    def set_zoom(self, value: int) -> None:
-        """Set zoom level via XU_PTZ_CMD_CONTROL (selector 4).
-
-        Value: 100-400.
-        STUB: The PTZ command format likely packs zoom into a multi-field
-        struct alongside pan/tilt.  Needs USB capture to decode.
-        """
-        raise NotImplementedError(
-            'PTZ XU data format unknown.\n'
-            'Run tools/xu_capture.py to discover the correct bytes.')
-
-    def set_pan_tilt_absolute(self, pan: int, tilt: int) -> None:
-        """Set absolute pan/tilt via XU_PANTILT_ABSOLUTE_CONTROL (selector 26).
-
-        This is a NEW capability not available via the WebSocket API
-        (which only supports velocity-based joystick movement).
-        STUB: Data format unknown.
-        """
-        raise NotImplementedError(
-            'Absolute pan/tilt XU data format unknown.\n'
-            'Run tools/xu_capture.py to discover the correct bytes.')
-
-    def set_pan_tilt_relative(self, pan: int, tilt: int) -> None:
-        """Set relative pan/tilt via XU_PANTILT_RELATIVE_CONTROL (selector 22)."""
-        raise NotImplementedError(
-            'Relative pan/tilt XU data format unknown.\n'
-            'Run tools/xu_capture.py to discover the correct bytes.')
+    # ── HDR (func-enable bit 2) ─────────────────────────────────────────────
+    # Confirmed: 0x95→0x91 (off), 0x91→0x95 (on) = bit 2 toggle
 
     def set_hdr(self, on: bool) -> None:
-        """Toggle HDR.  Selector TBD (not directly mapped in proto ControlSelector)."""
-        raise NotImplementedError(
-            'HDR XU selector/data format unknown.\n'
-            'Run tools/xu_capture.py to discover the mapping.')
+        """Toggle HDR via func-enable bitmask bit 2."""
+        self._set_func_bit(2, on)
 
-    def set_exposure_value(self, value: int) -> None:
-        """Set exposure via XU_EXPOSURE_VALUE_CONTROL (selector 9)."""
-        raise NotImplementedError('Exposure XU data format unknown.')
+    def get_hdr(self) -> bool:
+        return bool(self._read_func_enable() & (1 << 2))
 
-    def set_ae_mode(self, auto: bool) -> None:
-        """Set auto-exposure mode via XU_AE_MODE_CONTROL (selector 30)."""
-        raise NotImplementedError('AE mode XU data format unknown.')
+    # ── Mirror / horizontal flip (func-enable bit 3) ────────────────────────
+    # Confirmed: 0x95→0x9d (on), 0x9d→0x95 (off) = bit 3 toggle
 
-    def set_exposure_time(self, value: int) -> None:
-        """Set shutter speed via XU_EXPOSURE_TIME_ABSOLUTE_CONTROL (selector 29)."""
-        raise NotImplementedError('Exposure time XU data format unknown.')
+    def set_mirror(self, on: bool) -> None:
+        """Toggle horizontal flip via func-enable bitmask bit 3."""
+        self._set_func_bit(3, on)
 
-    def set_af_mode(self, auto: bool) -> None:
-        """Set auto-focus mode via XU_AF_MODE_OR_DOWNLOAD_FILE (selector 15)."""
-        raise NotImplementedError('AF mode XU data format unknown.')
+    def get_mirror(self) -> bool:
+        return bool(self._read_func_enable() & (1 << 3))
 
-    def set_iso(self, value: int) -> None:
-        """Set ISO via XU_ISO_CONTROL (selector 25)."""
-        raise NotImplementedError('ISO XU data format unknown.')
-
-    def set_bias(self, value: int) -> None:
-        """Set image bias via XU_BIAS_CONTROL (selector 24)."""
-        raise NotImplementedError('Bias XU data format unknown.')
-
-    def set_track_speed(self, value: int) -> None:
-        """Set tracking speed via XU_TRACK_SPEED_CONTROL (selector 18)."""
-        raise NotImplementedError('Track speed XU data format unknown.')
-
-    def set_noise_cancel(self, on: bool) -> None:
-        """Toggle noise cancellation via XU_NOISE_CANCEL_CONTROL (selector 7)."""
-        raise NotImplementedError('Noise cancel XU data format unknown.')
+    # ── Gesture zoom (func-enable bit 4) ────────────────────────────────────
+    # Confirmed: 0x95→0x85 (off) = bit 4 cleared
 
     def set_gesture_control(self, on: bool) -> None:
-        """Toggle gesture control via XU_GESTURE_STATUS_CONTROL (selector 5)."""
-        raise NotImplementedError('Gesture control XU data format unknown.')
+        """Toggle gesture zoom via func-enable bitmask bit 4."""
+        self._set_func_bit(4, on)
 
-    def set_video_resolution(self, value: int) -> None:
-        """Set video resolution via XU_VIDEO_RES_CONTROL (selector 28)."""
-        raise NotImplementedError('Video resolution XU data format unknown.')
+    def get_gesture_control(self) -> bool:
+        return bool(self._read_func_enable() & (1 << 4))
 
-    def set_usb_mode(self, value: int) -> None:
-        """Switch USB mode via XU_USB_MODE_SWITCH_CONTROL (selector 17)."""
-        raise NotImplementedError('USB mode XU data format unknown.')
+    # ── Privacy (unit 10, sel 0x0F + func-enable bit 11) ────────────────────
+    # From prior research (unverified via capture — WS joystick causes reboot):
+    #   unit 10, sel 0x0F: 1-byte (0x01=on, 0x00=off)
+    #   unit 9, sel 0x1b: bit 11 (0x0800)
+    # Phase B will verify. For now, write both.
 
-    def set_layout_style(self, value: int) -> None:
-        """Set layout style via XU_LAYOUT_STYLE_CONTROL (selector 19)."""
-        raise NotImplementedError('Layout style XU data format unknown.')
+    def set_privacy(self, on: bool) -> None:
+        """Toggle privacy mode (physical camera tilt to face-down position)."""
+        self._xu_set(UNIT_XU2, 0x0f, bytes([0x01 if on else 0x00]))
+        self._set_func_bit(11, on)
+
+    def get_privacy(self) -> bool:
+        """Read privacy state from XU2 sel 0x0F."""
+        return self._xu_get(UNIT_XU2, 0x0f, 1)[0] != 0
+
+    # ── Brightness (unit 5, sel 0x02) ───────────────────────────────────────
+    # Confirmed: 1-byte, 0-100. Standard UVC PU Brightness.
+
+    def set_brightness(self, value: int) -> None:
+        """Set brightness 0-100."""
+        if not 0 <= value <= 100:
+            raise ValueError(f'Brightness must be 0-100, got {value}')
+        self._xu_set(UNIT_PU, 0x02, bytes([value]))
+
+    def get_brightness(self) -> int:
+        return self._xu_get(UNIT_PU, 0x02, 1)[0]
+
+    # ── Contrast (unit 5, sel 0x03) ─────────────────────────────────────────
+    # Confirmed: 1-byte, 0-100. Standard UVC PU Contrast.
+
+    def set_contrast(self, value: int) -> None:
+        """Set contrast 0-100."""
+        if not 0 <= value <= 100:
+            raise ValueError(f'Contrast must be 0-100, got {value}')
+        self._xu_set(UNIT_PU, 0x03, bytes([value]))
+
+    def get_contrast(self) -> int:
+        return self._xu_get(UNIT_PU, 0x03, 1)[0]
+
+    # ── Saturation (unit 5, sel 0x07) ───────────────────────────────────────
+    # Confirmed: 2-byte LE, 0-100.
+
+    def set_saturation(self, value: int) -> None:
+        """Set saturation 0-100."""
+        if not 0 <= value <= 100:
+            raise ValueError(f'Saturation must be 0-100, got {value}')
+        self._xu_set(UNIT_PU, 0x07, value.to_bytes(2, 'little'))
+
+    def get_saturation(self) -> int:
+        return int.from_bytes(self._xu_get(UNIT_PU, 0x07, 2), 'little')
+
+    # ── Sharpness (unit 5, sel 0x08) ────────────────────────────────────────
+    # Confirmed: 2-byte LE, 0-100.
+
+    def set_sharpness(self, value: int) -> None:
+        """Set sharpness 0-100."""
+        if not 0 <= value <= 100:
+            raise ValueError(f'Sharpness must be 0-100, got {value}')
+        self._xu_set(UNIT_PU, 0x08, value.to_bytes(2, 'little'))
+
+    def get_sharpness(self) -> int:
+        return int.from_bytes(self._xu_get(UNIT_PU, 0x08, 2), 'little')
+
+    # ── Exposure compensation (unit 9, sel 0x09) ────────────────────────────
+    # Confirmed: 2-byte LE. 0x0000=0%, 0x2710=100% (value × 100 internal).
+
+    def set_exposure_comp(self, value: int) -> None:
+        """Set exposure compensation 0-100."""
+        if not 0 <= value <= 100:
+            raise ValueError(f'Exposure comp must be 0-100, got {value}')
+        internal = value * 100  # 0→0, 100→10000
+        self._xu_set(UNIT_XU1, 0x09, internal.to_bytes(2, 'little'))
+
+    def get_exposure_comp(self) -> int:
+        raw = int.from_bytes(self._xu_get(UNIT_XU1, 0x09, 2), 'little')
+        return raw // 100
+
+    # ── Auto exposure (unit 9, sel 0x1e) ────────────────────────────────────
+    # Confirmed: 1-byte. 0x02=auto, 0x01=manual.
+
+    def set_ae_mode(self, auto: bool) -> None:
+        """Set auto-exposure mode."""
+        self._xu_set(UNIT_XU1, 0x1e, bytes([0x02 if auto else 0x01]))
+
+    def get_ae_mode(self) -> bool:
+        """Returns True if auto-exposure is on."""
+        return self._xu_get(UNIT_XU1, 0x1e, 1)[0] == 0x02
+
+    # ── Auto white balance (unit 5, sel 0x0b) ──────────────────────────────
+    # Confirmed: 1-byte. 0x01=auto, 0x00=manual.
+
+    def set_awb(self, auto: bool) -> None:
+        """Set auto white balance."""
+        self._xu_set(UNIT_PU, 0x0b, bytes([0x01 if auto else 0x00]))
+
+    def get_awb(self) -> bool:
+        return self._xu_get(UNIT_PU, 0x0b, 1)[0] == 0x01
+
+    # ── Anti-flicker (unit 5, sel 0x05) ─────────────────────────────────────
+    # Confirmed: 1-byte. 0x03=auto, 0x01=50Hz, 0x02=60Hz.
+
+    def set_anti_flicker(self, mode: int) -> None:
+        """Set anti-flicker. 0 or 3=auto, 1=50Hz, 2=60Hz."""
+        if mode == 0:
+            mode = 3  # normalize 0 → auto
+        if mode not in (1, 2, 3):
+            raise ValueError(f'Anti-flicker must be 1(50Hz), 2(60Hz), or 3(auto), got {mode}')
+        self._xu_set(UNIT_PU, 0x05, bytes([mode]))
+
+    def get_anti_flicker(self) -> int:
+        return self._xu_get(UNIT_PU, 0x05, 1)[0]
+
+    # ── Autofocus (unit 1, sel 0x08) ────────────────────────────────────────
+    # Confirmed: 1-byte. 0x01=auto, 0x00=manual.
+
+    def set_af_mode(self, auto: bool) -> None:
+        """Set autofocus mode."""
+        self._xu_set(UNIT_CT, 0x08, bytes([0x01 if auto else 0x00]))
+
+    def get_af_mode(self) -> bool:
+        return self._xu_get(UNIT_CT, 0x08, 1)[0] == 0x01
+
+    # ── Zoom (unit 1, sel 0x0b) ─────────────────────────────────────────────
+    # Confirmed: 1-byte. 0x64=1x(100). Observed 0x90=144 at 400% zoom.
+    # Mapping: linear scale where 100(0x64)=1x, need more data points.
+
+    def set_zoom(self, value: int) -> None:
+        """Set zoom level. Value 100-400 (1x-4x).
+
+        Internal mapping approximate — 0x64=100(1x), 0x90=144(4x).
+        """
+        if not 100 <= value <= 400:
+            raise ValueError(f'Zoom must be 100-400, got {value}')
+        # Linear map: 100→0x64(100), 400→0x90(144)
+        internal = 100 + (value - 100) * (144 - 100) // (400 - 100)
+        self._xu_set(UNIT_CT, 0x0b, bytes([internal]))
+
+    def get_zoom(self) -> int:
+        raw = self._xu_get(UNIT_CT, 0x0b, 1)[0]
+        # Reverse map
+        if raw <= 100:
+            return 100
+        return 100 + (raw - 100) * (400 - 100) // (144 - 100)
+
+    # ── Pan/Tilt absolute (unit 9, sel 0x1a) ────────────────────────────────
+    # Confirmed readable: 8-byte LE int32 pair (pan, tilt).
+    # Write format unverified — joystick capture showed no XU state change,
+    # suggesting movement is firmware-driven. SET_CUR may or may not work.
+
+    def set_pan_tilt_absolute(self, pan: int, tilt: int) -> None:
+        """Set absolute pan/tilt position (int32 pair, little-endian).
+
+        WARNING: Write format unverified. The camera may ignore SET_CUR
+        on this register if movement is firmware-only.
+        """
+        data = pan.to_bytes(4, 'little', signed=True) + tilt.to_bytes(4, 'little', signed=True)
+        self._xu_set(UNIT_XU1, 0x1a, data)
+
+    def get_pan_tilt_absolute(self) -> tuple[int, int]:
+        """Read absolute pan/tilt position. Returns (pan, tilt) as signed int32."""
+        data = self._xu_get(UNIT_XU1, 0x1a, 8)
+        pan = int.from_bytes(data[0:4], 'little', signed=True)
+        tilt = int.from_bytes(data[4:8], 'little', signed=True)
+        return pan, tilt
+
+    # ── Raw func-enable access ──────────────────────────────────────────────
 
     def set_func_enable(self, data: bytes) -> None:
-        """Raw func-enable control via XU_FUNC_ENABLE_CONTROL (selector 27).
+        """Raw func-enable write (unit 9, sel 0x1b)."""
+        self._xu_set(UNIT_XU1, 0x1b, data)
 
-        This is likely the privacy/feature-enable selector.  Use xu_capture.py
-        to determine the data format, then call this with the correct bytes.
-        """
-        self.xu_set_raw(XU_FUNC_ENABLE_CONTROL, data)
+    def get_func_enable(self) -> bytes:
+        """Raw func-enable read (unit 9, sel 0x1b, 2 bytes)."""
+        return self._xu_get(UNIT_XU1, 0x1b, 2)
 
     # ── Raw replay (for xu_capture.py Phase B) ───────────────────────────────
 
-    def replay_xu_command(self, selector: int, data: bytes) -> None:
-        """Replay a captured XU SET_CUR command (used by xu_capture.py Phase B)."""
-        self.xu_set_raw(selector, data)
+    def replay_xu_command(self, unit: int, selector: int, data: bytes) -> None:
+        """Replay a captured XU SET_CUR command to a specific unit."""
+        self._xu_set(unit, selector, data)
 
-    def replay_xu_get(self, selector: int, size: int) -> bytes:
-        """Replay a captured XU GET_CUR command."""
-        return self.xu_get_raw(selector, size)
+    def replay_xu_get(self, unit: int, selector: int, size: int) -> bytes:
+        """Replay a captured XU GET_CUR command from a specific unit."""
+        return self._xu_get(unit, selector, size)
 
 
 # ── CLI (for quick testing) ──────────────────────────────────────────────────
