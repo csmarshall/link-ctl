@@ -389,11 +389,34 @@ CT_ZOOM_ABSOLUTE_SEL    = 0x0B   # 2-byte: zoom uint16 LE (100..400)
 XU_PANTILT_READ_UNIT = 9
 XU_PANTILT_READ_SEL  = 0x1A
 
+# Prefer the in-process ctypes IOKit path (link_usb_macos) when running on
+# macOS — no subprocess overhead, no external binary required. Falls back
+# to tools/uvc-probe (subprocess) if the ctypes module can't find the
+# camera.
+_usb_backend = None
+try:
+    if platform.system() == 'Darwin':
+        import link_usb_macos as _usb_backend   # type: ignore
+except Exception:
+    _usb_backend = None
+
 def _uvc_probe_available() -> bool:
-    """True if the uvc-probe IOKit helper exists (macOS-only feature)."""
+    """True if any USB-direct path can reach the camera — either the
+    in-process ctypes backend or the `tools/uvc-probe` helper binary."""
+    if _usb_backend is not None:
+        try:
+            _usb_backend._get_handle()
+            return True
+        except Exception:
+            pass
     return UVC_PROBE.is_file() and os.access(UVC_PROBE, os.X_OK)
 
 def _uvc_get(unit: int, sel: int, length: int) -> bytes:
+    if _usb_backend is not None:
+        try:
+            return _usb_backend.get(unit, sel, length)
+        except Exception:
+            pass
     r = subprocess.run(
         [str(UVC_PROBE), 'get', str(unit), f'0x{sel:02x}', str(length)],
         capture_output=True, text=True, timeout=3)
@@ -402,6 +425,11 @@ def _uvc_get(unit: int, sel: int, length: int) -> bytes:
     return bytes.fromhex(r.stdout.strip())
 
 def _uvc_set(unit: int, sel: int, data: bytes) -> None:
+    if _usb_backend is not None:
+        try:
+            _usb_backend.set(unit, sel, data); return
+        except Exception:
+            pass
     r = subprocess.run(
         [str(UVC_PROBE), 'set', str(unit), f'0x{sel:02x}', data.hex()],
         capture_output=True, text=True, timeout=3)

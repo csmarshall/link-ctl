@@ -26,6 +26,20 @@ this is for you. Connecting software you own to hardware you own is [something w
 
 ---
 
+## What's new in v2.1
+
+- **Pure-Python IOKit access.** The USB-direct backend on macOS is now
+  `link_usb_macos.py` — a ~250-line ctypes module that calls `IOKit`
+  directly from Python. **No external binary** is needed at runtime;
+  `tools/uvc-probe` is kept as a CLI debugging tool and as a subprocess
+  fallback, but it's no longer on the hot path.
+- **12× faster.** Per-call latency went from ~6 ms (subprocess) to ~0.5 ms
+  (in-process). The interactive `joystick` UI is visibly snappier and
+  tight loops (e.g. `pan-rel` spam from a Stream Deck) no longer stutter.
+- **Library-first.** `import link_ctl; link_ctl.write_pantilt(0, 0)` now
+  does all its work in-process — no subprocess, no external dependency —
+  making link-ctl viable as a real Python library, not just a CLI.
+
 ## What's new in v2.0
 
 - **USB-direct control on macOS.** PTZ, presets, AI modes, image settings, and interactive
