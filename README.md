@@ -14,27 +14,61 @@ leaving original Link owners with a suggestion to use global hotkeys instead.
 
 That's a reasonable workaround, but it felt like a miss for people who had invested in the
 original hardware. The Link Controller app already exposes a local WebSocket API for its
-mobile remote — all the capability was there. This tool uses it.
+mobile remote — the first version of this tool used that path.
+
+In **v2.0** the tool goes a step further: on macOS it talks to the camera **directly over
+USB** using the same UVC Extension Unit registers the desktop app itself uses. You no
+longer need the Link Controller app running at all for PTZ, presets, or image/AI
+settings. No WebSocket, no token, no `sudo`, no code signing.
 
 If you have an OG Link and want proper automation, Stream Deck support, or scripting,
 this is for you. Connecting software you own to hardware you own is [something worth protecting](https://www.eff.org/deeplinks/2019/10/adversarial-interoperability).
 
 ---
 
+## What's new in v2.0
+
+- **USB-direct control on macOS.** PTZ, presets, AI modes, image settings, and interactive
+  joystick all work without the Link Controller desktop app running. The tool speaks
+  directly to the camera's UVC Extension Unit registers via a small IOKit helper
+  (`tools/uvc-probe`) that needs no `sudo`, no entitlements, and no code signing —
+  thanks to the "never open the interface" pattern from
+  [jtfrey/uvc-util](https://github.com/jtfrey/uvc-util).
+- **Interactive `joystick` mode.** Full-screen curses UI: arrow keys pan/tilt, `+`/`-`
+  zoom, `f` toggles 5× fast-mode, digits `0-9` recall presets, `s`/`n`/`d` save/
+  rename/delete presets, `c` centers. Built for quick manual framing.
+- **Host-side presets.** `preset-save`, `preset-recall`, `preset-rename`, `preset-delete`,
+  `preset-list` store camera position in `~/.config/link-ctl/presets.json` — 10 slots
+  with user-named entries. Survives Link Controller restarts because they don't live in
+  the app. See [Presets](#presets) for the file format.
+- **Removed `privacy` command.** On the original Link it was always theatre — the LED
+  stayed on, the sensor kept streaming, other apps still saw the feed. Use a physical
+  lens cover for real privacy, or the Link 2C's built-in shutter.
+- **Fix: `preset-save` now actually saves** (was silently `success=0 reason=0` on empty
+  slots in v1.x because it sent `UPDATE` instead of `ADD`).
+- **New commands**: `preset-recall`, `preset-update`, `preset-list`, `joystick`.
+
+See [CHANGELOG](#whats-new-in-v20) at top, or git history, for the full list.
+
+---
+
 ## Table of Contents
 
+- [What's new in v2.0](#whats-new-in-v20)
 - [Feature Matrix](#feature-matrix)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Commands](#commands)
   - [PTZ Control](#ptz-control)
-  - [Privacy](#privacy)
-  - [AI Modes](#ai-modes-macoswindows-only)
-  - [Image Settings](#image-settings-macoswindows-only)
+  - [AI Modes](#ai-modes)
+  - [Image Settings](#image-settings)
   - [Presets](#presets)
+  - [Interactive Joystick](#interactive-joystick)
   - [Diagnostics](#diagnostics)
   - [Global Flags](#global-flags)
+- [USB-direct vs WebSocket](#usb-direct-vs-websocket)
+- [File Locations](#file-locations)
 - [Preflight Checks](#preflight-checks)
 - [Port Discovery](#port-discovery)
 - [State Cache](#state-cache)
@@ -46,8 +80,12 @@ this is for you. Connecting software you own to hardware you own is [something w
 
 ---
 
-CLI tool to control an **Insta360 Link** (original) webcam by communicating
-with the **Insta360 Link Controller** desktop app via its local WebSocket server.
+CLI tool to control an **Insta360 Link** (original) webcam.
+
+On **macOS** the tool talks directly to the camera over USB — no app, no WebSocket.
+On **Windows** and as a fallback on macOS, it uses the Insta360 Link Controller
+desktop app's local WebSocket API. On **Linux** PTZ works via `v4l2-ctl`; image/AI
+settings still need the desktop app (which doesn't run on Linux today).
 
 > **Newer models:** Compatibility with the
 > [Link 2](https://github.com/csmarshall/link-ctl/issues/5),
@@ -55,9 +93,6 @@ with the **Insta360 Link Controller** desktop app via its local WebSocket server
 > [Link 2 Pro](https://github.com/csmarshall/link-ctl/issues/7), and
 > [Link 2C Pro](https://github.com/csmarshall/link-ctl/issues/8)
 > is unverified — if you have one, give it a try and report back!
-
-The Link Controller app must be running — that's expected and fine. You can
-minimize it or disable the preview; the WebSocket server stays active.
 
 ---
 
@@ -67,14 +102,15 @@ Legend: ✅ confirmed + validated · ⚠️ confirmed sent, limited/no readback 
 
 **PTZ**
 
-| UI Feature | CLI Command | paramType | validate.py | Notes |
+| UI Feature | CLI Command | USB-direct (macOS) | WS fallback | Notes |
 |---|---|---|---|---|
-| Zoom | `zoom N` / `zoom-rel ±N` | 4 | ✅ zoom | 100–400 |
-| Pan | `pan-rel N` | 6/7 | — | Velocity pulse; no absolute positioning |
-| Tilt | `tilt-rel N` | 6/7 | — | Velocity pulse |
-| Center/reset | `center` | 3 | — | Resets pan, tilt, and zoom |
-| Privacy | `privacy on\|off\|toggle` | 6/7 | — | Tilt to bottom stop (3.5 s pulse) |
-| Absolute pan/tilt | — | — | — | ❌ v2.2.1 is velocity-only; exits with code 4 |
+| Zoom | `zoom N` / `zoom-rel ±N` | ✅ CT(1) sel 0x0B | ✅ paramType 4 | 100–400, uint16 LE |
+| Pan (absolute) | `pan N` | ✅ CT(1) sel 0x0D | ❌ | USB-direct only (WS is velocity-only) |
+| Tilt (absolute) | `tilt N` | ✅ CT(1) sel 0x0D | ❌ | USB-direct only |
+| Pan (relative) | `pan-rel N` | ✅ | ✅ paramType 6/7 | 1 step = 3000 USB units |
+| Tilt (relative) | `tilt-rel N` | ✅ | ✅ paramType 6/7 | |
+| Center/reset | `center` | ✅ | ✅ paramType 3 | pan=0, tilt=0, zoom=100 |
+| Interactive joystick | `joystick` | ✅ | — | Full-screen curses UI |
 
 **AI Modes**
 
@@ -211,27 +247,23 @@ link-ctl privacy on
 ### PTZ Control
 
 ```bash
-link-ctl pan-rel <steps>   # Relative pan,  -30 .. 30 steps (velocity pulse)
-link-ctl tilt-rel <steps>  # Relative tilt, -30 .. 30 steps (velocity pulse)
-link-ctl zoom <value>      # Absolute zoom:  100 .. 400
+link-ctl pan <N>           # Absolute pan  (USB-direct only; not on WS)
+link-ctl tilt <N>          # Absolute tilt (USB-direct only; not on WS)
+link-ctl pan-rel <steps>   # Relative pan,  -30 .. 30 steps
+link-ctl tilt-rel <steps>  # Relative tilt, -30 .. 30 steps
+link-ctl zoom <value>      # Absolute zoom: 100 .. 400
 link-ctl zoom-rel <delta>  # Relative zoom (e.g. 50 or -50)
-link-ctl center            # Reset pan/tilt to center, zoom to 100
+link-ctl center            # Reset pan=0, tilt=0, zoom=100
 ```
 
-> **Note:** The v2.2.1 WebSocket API is velocity-only for pan/tilt. There is no
-> absolute pan/tilt command via WebSocket. `pan-rel` and `tilt-rel` work by
-> sending a joystick velocity for a calibrated duration.
+**Absolute pan/tilt** is only available on the USB-direct path (macOS with
+`tools/uvc-probe`). The WebSocket API in Link Controller v2.2.1 is
+velocity-only; USB-direct uses the camera's standard UVC
+`CT_PANTILT_ABSOLUTE_CONTROL` (unit 1, selector 0x0D) which accepts an
+8-byte `pan_int32_le + tilt_int32_le` payload. Approximate range is ±150000
+on each axis.
 
-### Privacy
-
-```bash
-link-ctl privacy on        # Tilt lens straight down (privacy position)
-link-ctl privacy off       # Return to center
-link-ctl privacy           # Smart toggle (same as 'toggle')
-link-ctl privacy toggle    # Explicit toggle
-```
-
-### AI Modes _(macOS/Windows only)_
+### AI Modes
 
 All AI mode commands accept `on`, `off`, or `toggle`. Omitting the argument
 smart-toggles based on the current mode.
@@ -244,7 +276,7 @@ link-ctl overhead [on|off|toggle]   # Overhead / top-down
 link-ctl normal                     # Return to standard mode (clears all AI modes)
 ```
 
-### Image Settings _(macOS/Windows only)_
+### Image Settings
 
 Toggle commands accept `on`, `off`, or `toggle`. Omitting the argument
 smart-toggles based on current device state. Exceptions:
@@ -272,11 +304,64 @@ link-ctl gesture-zoom [on|off|toggle]    # Gesture control zoom (toggle defaults
 
 ### Presets
 
+Presets store the camera's `(pan, tilt, zoom)` in a local JSON file. On
+macOS this is USB-direct — no desktop app, no WebSocket. Up to 10 named
+slots (0-9). On Windows / Linux the commands fall back to the WebSocket
+`PresetUpdateRequest` path.
+
 ```bash
-link-ctl preset <0-19>         # Recall a saved preset position
-link-ctl preset-save <0-19>    # Save current position as preset
-link-ctl preset-delete <0-19>  # Delete a preset slot
+link-ctl preset-save <0-9> [name]    # Save current PTZ, name is optional
+link-ctl preset-recall <0-9>         # Move camera back to saved position
+link-ctl preset <0-9>                # Alias for preset-recall
+link-ctl preset-rename <0-9> <name>  # Rename a saved preset
+link-ctl preset-delete <0-9>         # Remove a saved preset
+link-ctl preset-list [--json]        # Show all saved presets
 ```
+
+**Storage path:** `~/.config/link-ctl/presets.json`
+
+**Schema:**
+
+```json
+{
+  "version": 1,
+  "presets": {
+    "0": {"name": "desk",   "pan": 0,     "tilt": 0,     "zoom": 100},
+    "1": {"name": "window", "pan": 45000, "tilt": 60000, "zoom": 200}
+  }
+}
+```
+
+`pan` / `tilt` are signed 32-bit integers in the UVC Extension Unit's native
+units (roughly ±150000 full-range on each axis). `zoom` is an unsigned 16-bit
+integer in the range 100..400 (100 = 1×, 400 = 4×). The file is safe to
+hand-edit or generate from scripts; link-ctl reads it fresh on every command.
+
+### Interactive Joystick
+
+```bash
+link-ctl joystick
+```
+
+Full-screen curses UI with arrow keys for pan/tilt, `+`/`-` for zoom, and
+preset slot bindings. Requires `tools/uvc-probe` (macOS).
+
+```
+  Keys
+    arrows        pan / tilt
+    f             toggle fast mode (5× step)
+    shift+arrow   one-shot fast step (iTerm2 / terminals that send modifiers)
+    +/-           zoom in/out (step 10)
+    0-9           recall preset slot N
+    s             save current position to slot (prompts for slot + name)
+    n             rename a slot (prompts for slot + new name)
+    d             delete a slot
+    c             center (pan=0, tilt=0, zoom=100)
+    q             quit
+```
+
+Saves made in the joystick UI are stored in the same `presets.json` file as
+the `preset-*` CLI commands.
 
 ### Diagnostics
 
@@ -345,7 +430,72 @@ The discovered port is cached automatically.
 ```
 
 `zoom` is read from the device on each connection and used by `zoom-rel` to
-compute the new absolute value.
+compute the new absolute value (on the WebSocket path).
+
+---
+
+## USB-direct vs WebSocket
+
+Every command inside `link-ctl` picks one of two paths at runtime based on
+platform and whether `tools/uvc-probe` is available:
+
+| Platform | PTZ | Presets | AI modes / image | Fallback |
+|---|---|---|---|---|
+| **macOS** + `tools/uvc-probe` present | USB-direct | USB-direct | USB-direct | — |
+| **macOS** without uvc-probe | WS | WS | WS | Link Controller app must be running |
+| **Windows** | WS | WS | WS | Link Controller app must be running |
+| **Linux** | `v4l2-ctl` | WS (if Link Controller is somehow running) | WS | image/AI only works with the app |
+
+The `uvc-probe` binary is compiled from `tools/uvc-probe.m` (Objective-C /
+IOKit, ~350 lines) and bundled with the Homebrew formula and the release
+tarballs. It uses the "never open the interface" technique from
+[jtfrey/uvc-util](https://github.com/jtfrey/uvc-util) so it needs no `sudo`,
+no `com.apple.security.device.usb` entitlement, and no codesigning step —
+just `clang` and run.
+
+If you want to force the WebSocket path temporarily (e.g. to compare
+behaviour), rename `tools/uvc-probe` out of the way and re-run.
+
+---
+
+## File Locations
+
+| Path | Purpose |
+|---|---|
+| `~/.config/link-ctl/state.json` | Discovered WS port cache + last-known zoom |
+| `~/.config/link-ctl/presets.json` | USB-direct preset definitions (10 slots, JSON) |
+| `~/Library/Application Support/Insta360 Link Controller/startup.ini` | Link Controller app's WS auth token (used only by the WS fallback) |
+| `tools/uvc-probe` | IOKit helper (macOS) — compile from `tools/uvc-probe.m` |
+| `tools/usb-suspend` | USB suspend helper for real camera-off; needs sudo (not used by default) |
+
+---
+
+## Using as a Python library
+
+`link_ctl.py` is a single-module library — its top-level functions are the
+same ones the CLI dispatcher calls internally. You can import and use them
+from your own scripts:
+
+```python
+import link_ctl as lc
+
+pan, tilt = lc.read_pantilt()     # current position
+zoom = lc.read_zoom()             # 100..400
+lc.write_pantilt(0, 0)            # center
+lc.write_zoom(200)                # 2× zoom
+lc.write_ai_mode('track')         # enable AI tracking
+lc.write_ai_mode('normal')        # back to normal
+
+# Host-side presets (same JSON file as the CLI)
+lc.usb_preset_save(3, name='desk')
+info = lc.usb_preset_recall(3)    # → {'name': 'desk', 'pan': 0, 'tilt': 0, 'zoom': 100}
+lc.usb_preset_list()              # all slots
+```
+
+All the USB-direct functions above require `tools/uvc-probe` to be reachable
+from the working directory. A clean `link_ctl` package (submodules for
+`usb`, `ws`, `presets`, `cli`) is planned for a future release — the current
+module-level API is stable for v2.x.
 
 ---
 

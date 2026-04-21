@@ -1,10 +1,22 @@
 /*
  * uvc-probe.m — Probe and watch all UVC extension unit selectors on the Insta360 Link
  *
- * Usage:
- *   sudo tools/uvc-probe snapshot         # one-shot: print all readable selectors
- *   sudo tools/uvc-probe watch [ms]       # poll every ms (default 200), print changes
- *   sudo tools/uvc-probe server           # pipe mode: newline → snapshot + "END\n"
+ * Usage (no sudo, no code signing required — see note below):
+ *   tools/uvc-probe snapshot              # one-shot: print all readable selectors
+ *   tools/uvc-probe watch [ms]            # poll every ms (default 200), print changes
+ *   tools/uvc-probe server                # pipe mode: newline → snapshot + "END\n"
+ *   tools/uvc-probe get <unit> <sel> <len>
+ *   tools/uvc-probe set <unit> <sel> <hex>
+ *   tools/uvc-probe getset <unit> <sel> <hex>
+ *
+ * No privilege or entitlement is required because this binary never calls
+ * USBInterfaceOpen — ControlRequest works on the IOCFPlugIn handle alone,
+ * which avoids both the exclusive-access lock held by UVCAssistant and the
+ * privilege check that USBInterfaceOpen enforces.
+ *
+ * Credit: the "never open the interface" technique is lifted from uvc-util
+ * by J.T. Frey (https://github.com/jtfrey/uvc-util), which has used this
+ * pattern to drive UVC Extension Units from a plain Homebrew CLI for years.
  *
  * Compile:
  *   clang -o tools/uvc-probe tools/uvc-probe.m \
@@ -251,12 +263,11 @@ int main(int argc, char *argv[])
     IOUSBInterfaceInterface **iface = find_vc_interface();
     if (!iface) { fputs("VideoControl interface not found\n", stderr); return 1; }
 
-    IOReturn kr = (*iface)->USBInterfaceOpen(iface);
-    if (kr != kIOReturnSuccess && kr != kIOReturnExclusiveAccess) {
-        fprintf(stderr, "USBInterfaceOpen: %#x\n", kr); return 1;
-    }
-    if (kr == kIOReturnExclusiveAccess)
-        fputs("(sharing interface with UVCAssistant)\n", stderr);
+    // Intentionally NOT calling USBInterfaceOpen. ControlRequest works on the
+    // plugin handle alone, and skipping Open bypasses the privilege check that
+    // would otherwise require sudo or a com.apple.security.device.usb
+    // entitlement. UVCAssistant already owns the interface exclusively; we
+    // coexist via shared control transfers. (See jtfrey/uvc-util for prior art.)
 
     // Commands that don't need discovery
     if (strcmp(mode, "get") == 0) {
@@ -337,7 +348,6 @@ int main(int argc, char *argv[])
         }
     }
 
-    (*iface)->USBInterfaceClose(iface);
     (*iface)->Release(iface);
     return 0;
 }

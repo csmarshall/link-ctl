@@ -19,6 +19,16 @@ if not m:
     print("bump_version: could not find version in pyproject.toml", file=sys.stderr)
     sys.exit(1)
 
+# If the developer already edited the version line manually in this commit
+# (e.g. a deliberate major/minor bump), respect it and skip the auto patch
+# increment. Detect via the staged diff of pyproject.toml.
+diff = subprocess.run(
+    ["git", "diff", "--cached", str(PYPROJECT)],
+    capture_output=True, text=True).stdout
+if any(line.startswith(('-version =', '+version =')) for line in diff.splitlines()):
+    print("bump_version: manual version change detected, skipping auto-bump", flush=True)
+    sys.exit(0)
+
 major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
 old_ver = f"{major}.{minor}.{patch}"
 new_ver = f"{major}.{minor}.{patch + 1}"

@@ -382,9 +382,47 @@ Key points:
   exposure, pan/tilt readback. XU2 (unit 10) handles "privacy" on Link 2 only.
   Standard UVC units (CT=1, PU=5) handle zoom, brightness, contrast, etc.
 - **macOS access:** IOKit `IOUSBDevRequest` works alongside UVCAssistant for reads
-  and most writes. No exclusive access required except for privacy mode.
-- **Ad-hoc signing:** Native tools need USB entitlements to avoid `sudo`.
-  Run `tools/sign_adhoc.sh` after compiling (see Building Native Tools).
+  and writes. No exclusive access required, no `sudo`, and no code signing —
+  `uvc-probe` deliberately never calls `USBInterfaceOpen`, which is what would
+  otherwise trigger the privilege/entitlement check. This technique is borrowed
+  from [jtfrey/uvc-util](https://github.com/jtfrey/uvc-util), which has shipped
+  in Homebrew for years using the same no-open pattern. Camera off/on
+  (`usb-suspend`) is a different API (`USBDeviceSuspend`) that does require
+  an open device handle and therefore still needs `sudo`.
+
+### Confirmed XU selector map (v2.0)
+
+All selectors below are routed through `tools/uvc-probe` by the USB-direct
+dispatch in `link_ctl.py` (see `usb_image_dispatch`, `usb_ptz_dispatch`).
+Each has an empirical round-trip test in `tools/xu_verify.py`.
+
+| Logical control | CLI command | Unit | Sel | Length | Format | Source |
+|---|---|---|---|---|---|---|
+| Autofocus | `autofocus` | CT (1) | 0x08 | 1 | 1=auto, 0=manual | verified |
+| Zoom | `zoom`, `zoom-rel` | CT (1) | 0x0B | 2 | uint16 LE, 100..400 | verified |
+| Pan/Tilt absolute | `pan`, `tilt`, `center` | CT (1) | 0x0D | 8 | int32 LE pan + int32 LE tilt | verified |
+| Brightness | `brightness` | PU (5) | 0x02 | 1 | 0..100 | verified |
+| Contrast | `contrast` | PU (5) | 0x03 | 1 | 0..100 | verified |
+| Anti-flicker | `anti-flicker` | PU (5) | 0x05 | 1 | 3=auto, 1=50Hz, 2=60Hz | verified |
+| Saturation | `saturation` | PU (5) | 0x07 | 2 | uint16 LE 0..100 | verified |
+| Sharpness | `sharpness` | PU (5) | 0x08 | 2 | uint16 LE 0..100 | verified |
+| WB temperature | `wb-temp` | PU (5) | 0x0A | 2 | uint16 LE 2800..10000 (K) | standard UVC |
+| AWB | `awb` | PU (5) | 0x0B | 1 | 1=auto, 0=manual | verified |
+| AI video mode | `track`, `whiteboard`, `overhead`, `deskview`, `normal` | XU1 (9) | 0x02 | 52 | byte[0]=mode_id, byte[1]=flag | vrwallace |
+| Exposure comp | `exposurecomp` | XU1 (9) | 0x09 | 2 | int16 LE `(val−50)×6` | verified |
+| Smartcomp framing | `smartcomp-frame` | XU1 (9) | 0x13 | 1 | 1=head, 2=half, 3=full | vrwallace |
+| Pan/tilt readback | (internal `read_pantilt`) | XU1 (9) | 0x1A | 8 | int32 LE **tilt** + int32 LE **pan** | verified |
+| Func-enable bitmask | `hdr`, `mirror`, `gesture-zoom` | XU1 (9) | 0x1B | 2 | uint16 LE; bit 2=HDR, bit 3=mirror, bit 4=gesture-zoom | verified |
+| AE mode | `autoexposure` | XU1 (9) | 0x1E | 1 | 2=auto, 1=manual | verified |
+
+**Byte-order gotcha** — unit 9 sel 0x1A returns `(tilt, pan)` LE, whereas
+CT_PANTILT_ABSOLUTE at unit 1 sel 0x0D writes standard UVC `(pan, tilt)` LE.
+`read_pantilt()` and `write_pantilt()` hide this.
+
+**Still TBD** — the `smartcomposition` (AiZoom) master switch is presumed
+to live at bit 0 of the XU1 sel 0x1B bitmask (per SDK `ExtendFunction` enum
+ordering), but empirical verification is inconclusive. The command still
+falls through to the WebSocket path for now.
 
 ---
 
@@ -421,12 +459,11 @@ physical lens cover, see [API.md — "Privacy" Mode Comparison](API.md#privacy-m
 
 | File | Description |
 |------|-------------|
-| `tools/uvc-probe.m` | IOKit UVC register read/write tool. Supports snapshot (dump all selectors), watch (poll for changes), server (pipe mode for xu_capture.py), and direct get/set of individual unit/selector values. Requires sudo or ad-hoc signing. |
-| `tools/usb_suspend.m` | USB device suspend/resume via IOKit. Powers the camera fully off/on without unplugging. Requires sudo. |
+| `tools/uvc-probe.m` | IOKit UVC register read/write tool. Supports snapshot (dump all selectors), watch (poll for changes), server (pipe mode for xu_capture.py), and direct get/set of individual unit/selector values. Uses the no-open `ControlRequest` pattern from [jtfrey/uvc-util](https://github.com/jtfrey/uvc-util) — no `sudo` or signing required. |
+| `tools/usb_suspend.m` | USB device suspend/resume via IOKit. Powers the camera fully off/on without unplugging. Requires sudo (device-level `USBDeviceSuspend` needs an open device handle). |
 | `tools/xu_capture.py` | Automated XU control discovery. Snapshots XU register state before/after each WebSocket command to identify which registers change. Three phases: capture, replay (verify writes work without the desktop app), and report. |
 | `tools/xu_verify.py` | Phase B verification of XU control read/write. For each confirmed control: reads current value, writes a test value, reads back to verify, and restores the original. Works with the desktop app running. |
 | `tools/validate.py` | Live WebSocket command validator. Sends each known command and asserts the expected device state change via DeviceInfo readback. 17 tests covering all confirmed paramTypes. |
-| `tools/sign_adhoc.sh` | Ad-hoc code signing with USB entitlements for `uvc-probe` and `usb-suspend`. Allows IOKit USB access without sudo on macOS. |
 
 ---
 
@@ -448,13 +485,30 @@ clang -o tools/usb-suspend tools/usb_suspend.m \
     -framework IOKit -framework CoreFoundation -framework Foundation -ObjC
 ```
 
-### Ad-hoc signing (optional, avoids sudo for uvc-probe)
+### No code signing required
 
-```bash
-tools/sign_adhoc.sh
-```
+Earlier versions of these tools relied on ad-hoc signing with a
+`com.apple.security.device.usb` entitlement to avoid `sudo`. That turned out to
+be unnecessary: the entitlement is only enforced for sandboxed apps, and the
+privilege check was actually triggered by `USBInterfaceOpen`, not by
+`ControlRequest`. `uvc-probe` now skips `USBInterfaceOpen` entirely and
+issues control transfers on the plugin handle alone — the same pattern
+[jtfrey/uvc-util](https://github.com/jtfrey/uvc-util) has used in Homebrew for
+years. No `sudo`, no signing, no entitlement — just `clang` and run.
 
-This signs both binaries with a `com.apple.security.device.usb` entitlement,
-allowing IOKit USB access without root. After signing, `uvc-probe` read
-operations work without sudo. Write operations and `usb-suspend` still
-require sudo.
+`usb-suspend` is different: `USBDeviceSuspend` is a device-level call that
+requires an open handle, and opening the device while UVCAssistant owns it
+requires seizing (root UID check). A paid Apple Developer account would not
+change this — seize is a kernel check on effective UID, not a signing check.
+The practical options for camera off/on without sudo would be an SMJobBless
+privileged helper (large engineering lift) or a full CMIO Camera Extension
+(even larger). The sudoers entry documented below is the pragmatic answer.
+
+---
+
+## Acknowledgements
+
+- **[jtfrey/uvc-util](https://github.com/jtfrey/uvc-util)** — the IOKit
+  "never open the interface" pattern used by `tools/uvc-probe` comes from
+  this tool. Without it, `link-ctl` would still depend on `sudo` or ad-hoc
+  code signing to read and write UVC Extension Unit registers on macOS.

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "link-ctl"
-version = "1.0.6"
-description = "CLI controller for Insta360 Link webcam via Link Controller app"
+version = "2.0.0"
+description = "CLI + Python library for the Insta360 Link webcam — USB-direct on macOS, WebSocket fallback on Windows, v4l2 on Linux"
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.11"
