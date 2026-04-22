@@ -28,6 +28,11 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Tolerate re-running the workflow after a version is already
+          # published — means subsequent steps (Homebrew formula update)
+          # aren't blocked by "file already exists" errors from PyPI.
+          skip-existing: true
         # Uses OIDC trusted publishing — no PYPI_TOKEN secret required.
         # One-time setup: PyPI → project → Publishing → add trusted publisher:
         #   Owner: csmarshall  Repo: link-ctl  Workflow: release.yml  Environment: pypi
