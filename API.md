@@ -11,7 +11,7 @@ envelope. All paramType numbers also changed.
 
 All values here were confirmed by live tshark captures on loopback (`lo0`) and direct
 WebSocket tests against a real camera. See [`link_ctl.py`](link_ctl.py) for a complete
-Python implementation and [`validate.py`](validate.py) for automated tests.
+Python implementation and [`validate.py`](tools/validate.py) for automated tests.
 
 ---
 
@@ -319,3 +319,135 @@ Protocol was reverse-engineered by:
 The `.proto` schema shipped in the app bundle (`insta360linkcontroller.proto`) provided
 message structure but **incorrect paramType enum values** for v2.2.1 — all numbers were
 verified empirically.
+
+---
+
+## USB Direct Control (UVC Extension Units)
+
+In addition to the WebSocket protocol, the camera can be controlled directly via USB
+UVC Extension Unit (XU) registers using IOKit on macOS or ioctl on Linux. This removes
+the dependency on the Insta360 Link Controller desktop app.
+
+All values below were confirmed by automated capture (`tools/xu_capture.py` using
+`tools/uvc-probe` in server mode) and Phase B read/write verification.
+
+### UVC Unit Map
+
+| Unit | Type | Role |
+|------|------|------|
+| 1 | Camera Terminal (CT) | Autofocus, zoom |
+| 5 | Processing Unit (PU) | Brightness, contrast, saturation, sharpness, AWB, anti-flicker |
+| 9 | Extension Unit 1 (XU1) | AI mode, func-enable bitmask, exposure, pan/tilt, tracking |
+| 10 | Extension Unit 2 (XU2) | "Privacy" (Link 2/2 Pro only) |
+| 11 | Extension Unit 3 (XU3) | Mirrors some XU1 values (video mode) |
+
+### Confirmed Controls (read/write verified on original Link)
+
+| Control | Unit | Selector | Size | Format | Notes |
+|---------|------|----------|------|--------|-------|
+| AI Mode | XU1 (9) | 0x02 | 1 | 0=normal, 1=tracking, 4=overhead, 5=deskview, 6=whiteboard | Readback shows 0xFF during transition; wait 1s |
+| HDR | XU1 (9) | 0x1b | 2 | Bitmask bit 2 | Read-modify-write the 2-byte LE bitmask |
+| Mirror (H-flip) | XU1 (9) | 0x1b | 2 | Bitmask bit 3 | |
+| Gesture Zoom | XU1 (9) | 0x1b | 2 | Bitmask bit 4 | |
+| Exposure Comp | XU1 (9) | 0x09 | 2 | LE uint16, value × 100 | 0=0%, 10000=100% |
+| AE Mode | XU1 (9) | 0x1e | 1 | 2=auto, 1=manual | |
+| Brightness | PU (5) | 0x02 | 1 | 0–100 | |
+| Contrast | PU (5) | 0x03 | 1 | 0–100 | |
+| Saturation | PU (5) | 0x07 | 2 | LE uint16, 0–100 | |
+| Sharpness | PU (5) | 0x08 | 2 | LE uint16, 0–100 | |
+| AWB | PU (5) | 0x0b | 1 | 1=auto, 0=manual | |
+| Anti-flicker | PU (5) | 0x05 | 1 | 3=auto, 1=50Hz, 2=60Hz | |
+| Autofocus | CT (1) | 0x08 | 1 | 1=auto, 0=manual | |
+| Zoom | CT (1) | 0x0b | 1 | 0x64=1x (100) | Mapping not fully calibrated |
+| Pan/Tilt (read) | XU1 (9) | 0x1a | 8 | Two LE int32: pan, tilt | Read-only; SET_CUR ignored by firmware |
+
+### Func-enable Bitmask (unit 9, selector 0x1b)
+
+The 2-byte little-endian bitmask at XU1 selector 0x1b controls multiple features.
+Read the current value, flip the desired bit, write it back.
+
+| Bit | Feature | Confirmed |
+|-----|---------|-----------|
+| 2 | HDR | Yes |
+| 3 | Mirror (horizontal flip) | Yes |
+| 4 | Gesture zoom | Yes |
+| 11 | "Privacy" (ExtremePrivacy) | Link 2/2 Pro only; firmware ignores on original Link |
+
+### Noise Registers (change on most operations, not controllable)
+
+| Unit | Selector | Name | Notes |
+|------|----------|------|-------|
+| 5 | 0x0a | Sensor status | Changes with nearly every operation |
+| 9 | 0x19 | ISO/AE readback | Auto-exposure state, not writable |
+| 9 | 0x0b | Device status | 5-byte status word |
+| 9 | 0x0f | AF/exposure readback | Changes with zoom, mode, focus operations |
+
+### Camera Off/On (USB Device Suspend)
+
+The camera can be fully powered down via USB device suspend. This is the only way to
+truly turn off the camera on the original Link (firmware does not support software
+"privacy" mode). Requires `sudo` for exclusive USB device access.
+
+```bash
+# Camera OFF
+sudo killall UVCAssistant; sudo tools/usb-suspend suspend
+
+# Camera ON (re-enumerates the USB device — simulates unplug/replug)
+sudo tools/usb-suspend resume
+```
+
+Settings (AI tracking mode, image adjustments, etc.) persist through the suspend/resume
+cycle. Resume uses `USBDeviceReEnumerate` internally, which causes UVCAssistant to
+auto-respawn and re-discover the camera. Apps like FaceTime will need to reselect the
+camera after resume.
+
+To allow passwordless operation (e.g., for Stream Deck buttons), add to `/etc/sudoers`:
+```
+username ALL=(root) NOPASSWD: /path/to/tools/usb-suspend, /usr/bin/killall UVCAssistant
+```
+
+### "Privacy" Mode Comparison
+
+Insta360 markets "privacy mode" across the Link family, but the implementations vary
+significantly — and none provide true optical privacy except the Link 2C's physical cover.
+
+| | USB Suspend (link-ctl) | Insta360 "Privacy" (Link 2/2 Pro) | Link 2C/2C Pro |
+|---|---|---|---|
+| Mechanism | USB power cut | Gimbal tilts lens down to desk | Physical sliding lens cover |
+| Lens blocked | N/A (no power) | **No** (points at desk, lens exposed) | **Yes** (optic blocked) |
+| Camera LED | Off | Yellow ("privacy") / Off ("sleep") | N/A |
+| Video stream | Fully stopped (0 bandwidth) | Stops (app must reopen to wake) | Blocked optically |
+| Mic | Muted (no power) | Optional mute (2 Pro: auto) | No mute |
+| Settings persist | Yes | Yes | N/A |
+| Requires sudo | Yes | No | Physical switch |
+| Recovery time | ~5 seconds | ~2 seconds | Instant |
+| All Link models | **Yes** | Link 2 / 2 Pro only | 2C / 2C Pro only |
+| Auto-activate | No (manual only) | Yes (10s inactivity timeout) | No |
+
+> **Note:** We have not tested Insta360's native "privacy" mode on Link 2 hardware at
+> the USB level. The behavior described above is from Insta360's official documentation.
+> If you have a Link 2 and can help validate the actual UVC-level behavior, please
+> [open an issue](https://github.com/csmarshall/link-ctl/issues).
+
+### Insta360 Stream Deck Plugin SDK
+
+The Insta360 Stream Deck plugin ships a complete native UVC control SDK at:
+```
+~/Library/Application Support/com.elgato.StreamDeck/Plugins/
+  com.insta360.webcam.sdPlugin/bin/sdk/
+```
+
+Key files:
+- `macos/UVCCameraNode.node` — native Node.js addon (universal binary, arm64+x86_64)
+- `sdk.ts` — TypeScript type definitions for CameraController
+- `API.zh-CN.md` — full Chinese API documentation
+- `test.js` — example usage code
+
+The SDK uses IOKit (`IOUSBDevRequest` via `ControlRequest`) for UVC control transfers,
+same approach as `tools/uvc-probe`. It works alongside UVCAssistant without exclusive
+access for all controls except "privacy".
+
+**Important:** `getCameraInfoList()` filters out the original Link by PID. However,
+`CameraController` accepts manually constructed camera info with the correct `localId`
+(IOKit `locationID`), bypassing the filter. All controls work on the original Link
+except firmware-limited "privacy" mode.

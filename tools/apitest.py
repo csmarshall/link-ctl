@@ -187,18 +187,6 @@ async def run_tests(port: int, token: str | None, debug: bool = False):
     await send("preset recall 0", build_preset_recall(serial, 0))
     await send("preset recall 1", build_preset_recall(serial, 1))
 
-    # ── Privacy (velocity tilt-down — stop always fires via try/finally) ───────
-    log("privacy on  (tilt down at -1.0 for 3.5s)")
-    try:
-        await client._send(build_joystick(serial, 0.0, -1.0))
-        await asyncio.sleep(3.5)
-    finally:
-        await client._send(build_joystick_stop(serial))
-    await pause(1.0)
-
-    await send("privacy off (center/reset, paramType=3)",
-               build_value_change(serial, ParamTypeV2.NORMAL_RESET))
-
     # ── Probe unknown paramTypes ──────────────────────────────────────────────
     # These are guesses based on proto field numbers. Watch capture for responses.
     print("\n[apitest] Probing unknown paramTypes (watch capture for camera response)...\n",

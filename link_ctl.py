@@ -182,9 +182,25 @@ def build_zoom(serial: str, value: int) -> bytes:
     return build_value_change(serial, ParamTypeV2.ZOOM, str(value))
 
 def build_preset_save(serial: str, index: int) -> bytes:
-    """PresetUpdateRequest type=1 (UPDATE): overwrite existing preset at index with current position.
-    Confirmed wire format from capture: field1=op, field2=index, field4=serial.
+    """PresetUpdateRequest type=0 (ADD): save current position as a new preset at index.
+
+    This matches the mobile web UI's "+ Add new preset" button — confirmed by
+    wire-level capture on 2026-04-17: the mobile UI sends type=0 ADD and the
+    preset persists. Our previous type=1 (UPDATE) implementation returned
+    success=0 from the server and failed to persist empty slots, which looked
+    like a broken command. The server's success field is a misleading ack —
+    both types echo success=0, but only ADD actually creates the preset.
+
+    Use build_preset_update() (type=1) if you want to overwrite an already
+    populated slot with a new position.
     """
+    inner = _int_f(1, 0) + _int_f(2, index) + _str_f(4, serial)
+    return _bool_f(6, True) + _msg_f(15, inner)
+
+def build_preset_update(serial: str, index: int) -> bytes:
+    """PresetUpdateRequest type=1 (UPDATE): overwrite an already-populated
+    preset at index with the current camera position. Only works for non-empty
+    slots; for empty slots use build_preset_save (type=0 ADD)."""
     inner = _int_f(1, 1) + _int_f(2, index) + _str_f(4, serial)
     return _bool_f(6, True) + _msg_f(15, inner)
 
@@ -193,6 +209,15 @@ def build_preset_delete(serial: str, index: int) -> bytes:
     Confirmed wire format from capture: field1=op, field2=index, field4=serial.
     """
     inner = _int_f(1, 2) + _int_f(2, index) + _str_f(4, serial)
+    return _bool_f(6, True) + _msg_f(15, inner)
+
+def build_preset_rename(serial: str, index: int, name: str) -> bytes:
+    """PresetUpdateRequest type=3 (RENAME): rename preset at index.
+    Wire format follows the existing pattern plus field3=name (proto:
+    PresetUpdateRequest.name = 3).
+    """
+    inner = (_int_f(1, 3) + _int_f(2, index)
+             + _str_f(3, name) + _str_f(4, serial))
     return _bool_f(6, True) + _msg_f(15, inner)
 
 def build_preset_recall(serial: str, index: int) -> bytes:
@@ -321,6 +346,7 @@ def parse_response(data: bytes) -> dict:
 
 CONFIG_DIR = Path.home() / '.config' / 'link-ctl'
 STATE_FILE  = CONFIG_DIR / 'state.json'
+PRESET_FILE = CONFIG_DIR / 'presets.json'   # host-side USB preset storage
 PORT_CACHE_TTL = 300  # 5 minutes
 
 def load_state() -> dict:
@@ -338,6 +364,411 @@ def invalidate_port_cache():
     state.pop('port', None)
     state.pop('timestamp', None)
     save_state(state)
+
+# ── USB-direct PTZ + host-side preset storage ────────────────────────────────
+# The Insta360 Link has no firmware-side preset feature — presets are purely
+# host-side state (same design as vrwallace/Insta360-Link-Controller-for-Linux
+# and the Insta360 SDK). link-ctl stores (pan, tilt, zoom) tuples in a local
+# JSON file and uses standard UVC Camera-Terminal controls to read/write
+# position via our uvc-probe binary (no WebSocket, no Link Controller app,
+# no token required).
+#
+# Wire format gotcha: unit 9 sel 0x1a readback returns the 8-byte tuple in
+# (tilt, pan) order, whereas unit 1 sel 0x0D SET_CUR expects standard UVC
+# (pan, tilt) order. We convert on each boundary; logical pan/tilt values
+# in this module are always in the natural (pan, tilt) sense.
+
+UVC_PROBE = Path(__file__).resolve().parent / 'tools' / 'uvc-probe'
+
+# Camera Terminal (unit 1) standard UVC controls
+CT_PANTILT_ABSOLUTE_SEL = 0x0D   # 8-byte: pan int32 LE + tilt int32 LE
+CT_ZOOM_ABSOLUTE_SEL    = 0x0B   # 2-byte: zoom uint16 LE (100..400)
+
+# Insta360 XU1 (unit 9) pan/tilt readback (SET_CUR ignored here; reads in
+# reversed (tilt, pan) order).
+XU_PANTILT_READ_UNIT = 9
+XU_PANTILT_READ_SEL  = 0x1A
+
+# Prefer the in-process ctypes IOKit path (link_usb_macos) when running on
+# macOS — no subprocess overhead, no external binary required. Falls back
+# to tools/uvc-probe (subprocess) if the ctypes module can't find the
+# camera.
+_usb_backend = None
+try:
+    if platform.system() == 'Darwin':
+        import link_usb_macos as _usb_backend   # type: ignore
+except Exception:
+    _usb_backend = None
+
+def _uvc_probe_available() -> bool:
+    """True if any USB-direct path can reach the camera — either the
+    in-process ctypes backend or the `tools/uvc-probe` helper binary."""
+    if _usb_backend is not None:
+        try:
+            _usb_backend._get_handle()
+            return True
+        except Exception:
+            pass
+    return UVC_PROBE.is_file() and os.access(UVC_PROBE, os.X_OK)
+
+def _uvc_get(unit: int, sel: int, length: int) -> bytes:
+    if _usb_backend is not None:
+        try:
+            return _usb_backend.get(unit, sel, length)
+        except Exception:
+            pass
+    r = subprocess.run(
+        [str(UVC_PROBE), 'get', str(unit), f'0x{sel:02x}', str(length)],
+        capture_output=True, text=True, timeout=3)
+    if r.returncode != 0:
+        raise RuntimeError(f'uvc-probe get u={unit} s=0x{sel:02x} failed: {r.stderr.strip()}')
+    return bytes.fromhex(r.stdout.strip())
+
+def _uvc_set(unit: int, sel: int, data: bytes) -> None:
+    if _usb_backend is not None:
+        try:
+            _usb_backend.set(unit, sel, data); return
+        except Exception:
+            pass
+    r = subprocess.run(
+        [str(UVC_PROBE), 'set', str(unit), f'0x{sel:02x}', data.hex()],
+        capture_output=True, text=True, timeout=3)
+    if r.returncode != 0:
+        raise RuntimeError(f'uvc-probe set u={unit} s=0x{sel:02x} failed: {r.stderr.strip()}')
+
+def read_pantilt() -> tuple[int, int]:
+    """Return current (pan, tilt). Reads XU1 sel 0x1a which returns the pair
+    in reversed (tilt, pan) order — we swap so callers always see (pan, tilt)."""
+    raw = _uvc_get(XU_PANTILT_READ_UNIT, XU_PANTILT_READ_SEL, 8)
+    t, p = struct.unpack('<ii', raw)
+    return p, t
+
+def write_pantilt(pan: int, tilt: int) -> None:
+    """Send standard UVC CT_PANTILT_ABSOLUTE at unit 1 sel 0x0d. Firmware
+    snaps the requested position to the nearest supported stop."""
+    _uvc_set(1, CT_PANTILT_ABSOLUTE_SEL, struct.pack('<ii', pan, tilt))
+
+def read_zoom() -> int:
+    raw = _uvc_get(1, CT_ZOOM_ABSOLUTE_SEL, 2)
+    return struct.unpack('<H', raw)[0]
+
+def write_zoom(zoom: int) -> None:
+    if not (100 <= zoom <= 400):
+        raise ValueError(f'zoom {zoom} out of range 100..400')
+    _uvc_set(1, CT_ZOOM_ABSOLUTE_SEL, struct.pack('<H', zoom))
+
+def load_presets() -> dict:
+    try:
+        d = json.loads(PRESET_FILE.read_text())
+        return d if isinstance(d, dict) and 'presets' in d else {'version': 1, 'presets': {}}
+    except Exception:
+        return {'version': 1, 'presets': {}}
+
+def save_presets(presets: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    PRESET_FILE.write_text(json.dumps(presets, indent=2) + '\n')
+
+def usb_preset_save(idx: int, name: str | None = None) -> dict:
+    pan, tilt = read_pantilt()
+    zoom = read_zoom()
+    presets = load_presets()
+    entry = presets['presets'].get(str(idx), {})
+    entry.update({
+        'name': name or entry.get('name') or f'preset_{idx}',
+        'pan': pan, 'tilt': tilt, 'zoom': zoom,
+    })
+    presets['presets'][str(idx)] = entry
+    save_presets(presets)
+    return entry
+
+def usb_preset_recall(idx: int) -> dict:
+    presets = load_presets()
+    entry = presets['presets'].get(str(idx))
+    if not entry:
+        raise KeyError(f'no preset at slot {idx}')
+    write_pantilt(entry['pan'], entry['tilt'])
+    write_zoom(entry['zoom'])
+    return entry
+
+def usb_preset_delete(idx: int) -> bool:
+    presets = load_presets()
+    if str(idx) not in presets['presets']:
+        return False
+    del presets['presets'][str(idx)]
+    save_presets(presets)
+    return True
+
+def usb_preset_rename(idx: int, name: str) -> dict:
+    presets = load_presets()
+    entry = presets['presets'].get(str(idx))
+    if not entry:
+        raise KeyError(f'no preset at slot {idx}')
+    entry['name'] = name
+    presets['presets'][str(idx)] = entry
+    save_presets(presets)
+    return entry
+
+def usb_preset_list() -> list[dict]:
+    presets = load_presets()
+    return [
+        {'id': int(k), **v}
+        for k, v in sorted(presets['presets'].items(), key=lambda x: int(x[0]))
+    ]
+
+# ── USB-direct image / AI control selector map ──────────────────────────────
+# Selectors for the original Link's Processing Unit (5), Camera Terminal (1),
+# and XU1 (unit 9). High-confidence entries come from xu_verify.py roundtrip
+# tests on this repo; medium-confidence entries (AI mode buffer layout, smart
+# framing selector) come from vrwallace's Linux controller research. Range
+# limits match the desktop app's sliders.
+#
+# References:
+#   - session-state.md "Verified XU Control Map (16 controls)"
+#   - https://github.com/vrwallace/Insta360-Link-1-and-2-Controller-for-Linux
+
+# Unit 9 sel 0x1b: 2-byte LE bitmask driving XU_FUNC_ENABLE_CONTROL. Each bit
+# toggles a separate feature; read-modify-write to avoid clobbering.
+#
+# Bit assignments are aligned with the order of the SDK's ExtendFunction
+# enum (sdk.ts: AiZoom, AF, HDR, Mirror, Ai, VScreen, …). HDR/Mirror/Ai at
+# bits 2/3/4 are empirically verified via xu_verify.py. Other bits (AiZoom
+# aka "smart composition" at bit 0 per enum order; VScreen / EnableStartup /
+# SingleTap / FullTracking at bits 5..9 per enum order) are not yet
+# mapped — the `smartcomposition` command still falls through to the WS
+# path (paramType 11) until we can empirically confirm each bit.
+BITMASK_UNIT = 9
+BITMASK_SEL  = 0x1B
+BIT_HDR           = 2
+BIT_MIRROR        = 3
+BIT_GESTURE_ZOOM  = 4
+# TBD: BIT_SMARTCOMP / BIT_AF / BIT_VSCREEN / … — need capture to confirm
+
+def _bitmask_get() -> int:
+    return int.from_bytes(_uvc_get(BITMASK_UNIT, BITMASK_SEL, 2), 'little')
+
+def _bitmask_set_bit(bit: int, on: bool) -> None:
+    val = _bitmask_get()
+    val = val | (1 << bit) if on else val & ~(1 << bit)
+    _uvc_set(BITMASK_UNIT, BITMASK_SEL, val.to_bytes(2, 'little'))
+
+def _bitmask_get_bit(bit: int) -> bool:
+    return bool(_bitmask_get() & (1 << bit))
+
+# AI video-mode buffer at unit 9 sel 0x02 — 52 bytes, byte[0]=mode_id,
+# byte[1]=mode_flag, rest zero. vrwallace's map:
+AI_MODE_SEL   = 0x02
+AI_MODE_LEN   = 52
+AI_MODE_BYTES = {
+    'normal':     (0x00, 0x00),
+    'track':      (0x01, 0x00),
+    'whiteboard': (0x04, 0x01),
+    'overhead':   (0x05, 0x03),
+    'deskview':   (0x06, 0x10),
+}
+
+def write_ai_mode(mode_name: str) -> None:
+    mode_id, flag = AI_MODE_BYTES[mode_name]
+    buf = bytearray(AI_MODE_LEN)
+    buf[0] = mode_id
+    buf[1] = flag
+    _uvc_set(9, AI_MODE_SEL, bytes(buf))
+
+def read_ai_mode() -> str:
+    """Read the current video mode. The firmware's GET_LEN reports 1 for
+    this selector even though SET_CUR accepts the full 52-byte AI buffer;
+    we try the short form first, then fall back to the long one."""
+    raw = None
+    for length in (1, 2, 52):
+        try:
+            raw = _uvc_get(9, AI_MODE_SEL, length); break
+        except Exception: continue
+    if not raw: return 'unknown'
+    mid = raw[0]; flag = raw[1] if len(raw) > 1 else 0
+    for name, (m, f) in AI_MODE_BYTES.items():
+        if m == mid and (len(raw) < 2 or f == flag):
+            return name
+    return f'unknown(0x{mid:02x}/0x{flag:02x})'
+
+# Smart framing (composition style) at unit 9 sel 0x13 (19), 1 byte.
+FRAMING_SEL = 0x13
+FRAMING_BYTES = {'head': 1, 'halfbody': 2, 'wholebody': 3}
+
+# Exposure-compensation scale: XU stores as int16 LE where 100 = 1 EV.
+# Desktop app exposes 0..100 where 50 = 0 EV; here we keep the same API
+# surface for consistency. Internal value = (user_value - 50) * 6 (gives
+# ±3 EV range across 0..100 in 0.06 EV steps, matching the WS behavior).
+def _ec_user_to_wire(v: int) -> bytes:
+    return struct.pack('<h', (v - 50) * 6)
+
+def _ec_wire_to_user(raw: bytes) -> int:
+    return struct.unpack('<h', raw)[0] // 6 + 50
+
+# AE mode at unit 9 sel 0x1e — 1 byte. 2=auto, 1=manual.
+# Anti-flicker at unit 5 sel 0x05 — 1 byte. 3=auto, 1=50Hz, 2=60Hz.
+AF_MAP = {'auto': 3, '50hz': 1, '60hz': 2}
+
+
+# ── USB-direct PTZ commands ──────────────────────────────────────────────────
+# Same step sizing as the joystick UI so behavior matches across interfaces.
+USB_PAN_STEP  = 3000
+USB_TILT_STEP = 3000
+
+def usb_image_dispatch(args) -> None:
+    """USB-direct image and AI-mode commands via uvc-probe — no WebSocket,
+    no Link Controller, no token required. Covers every control the desktop
+    app exposes except firmware update / device rename / factory reset."""
+    cmd = args.command
+    try:
+        # ── Bitmask-bit controls (HDR / mirror / gesture-zoom) ────────────────
+        if cmd in ('hdr', 'mirror', 'gesture-zoom'):
+            bit = {'hdr': BIT_HDR, 'mirror': BIT_MIRROR,
+                   'gesture-zoom': BIT_GESTURE_ZOOM}[cmd]
+            target = args.state
+            cur = _bitmask_get_bit(bit)
+            if target in (None, 'toggle'):
+                target = 'off' if cur else 'on'
+            _bitmask_set_bit(bit, target == 'on')
+            _info(f"{cmd}: {'on' if cur else 'off'} → {target}")
+
+        # ── Processing Unit 1-byte scalars ────────────────────────────────────
+        elif cmd == 'brightness':
+            v = args.value
+            if not (0 <= v <= 100): raise ValueError('brightness 0..100')
+            _uvc_set(5, 0x02, bytes([v])); _info(f'brightness → {v}')
+        elif cmd == 'contrast':
+            v = args.value
+            if not (0 <= v <= 100): raise ValueError('contrast 0..100')
+            _uvc_set(5, 0x03, bytes([v])); _info(f'contrast → {v}')
+
+        # ── Processing Unit 2-byte scalars ────────────────────────────────────
+        elif cmd == 'saturation':
+            v = args.value
+            if not (0 <= v <= 100): raise ValueError('saturation 0..100')
+            _uvc_set(5, 0x07, struct.pack('<H', v)); _info(f'saturation → {v}')
+        elif cmd == 'sharpness':
+            v = args.value
+            if not (0 <= v <= 100): raise ValueError('sharpness 0..100')
+            _uvc_set(5, 0x08, struct.pack('<H', v)); _info(f'sharpness → {v}')
+        elif cmd == 'wb-temp':
+            v = args.value
+            if not (2800 <= v <= 10000):
+                raise ValueError('wb-temp 2800..10000 K (AWB must be off)')
+            _uvc_set(5, 0x0A, struct.pack('<H', v))
+            _info(f'wb-temp → {v} K')
+
+        # ── Exposure / AWB / AF / anti-flicker ────────────────────────────────
+        elif cmd == 'exposurecomp':
+            v = args.value
+            if not (0 <= v <= 100): raise ValueError('exposurecomp 0..100')
+            _uvc_set(9, 0x09, _ec_user_to_wire(v))
+            _info(f'exposurecomp → {v}  (50 = 0 EV)')
+        elif cmd == 'autoexposure':
+            target = args.state
+            cur_raw = _uvc_get(9, 0x1e, 1)
+            cur = 'on' if cur_raw == bytes([2]) else 'off'
+            if target in (None, 'toggle'):
+                target = 'off' if cur == 'on' else 'on'
+            _uvc_set(9, 0x1e, bytes([2 if target == 'on' else 1]))
+            _info(f'autoexposure: {cur} → {target}')
+        elif cmd == 'awb':
+            target = args.state
+            cur = 'on' if _uvc_get(5, 0x0B, 1) == bytes([1]) else 'off'
+            if target in (None, 'toggle'):
+                target = 'off' if cur == 'on' else 'on'
+            _uvc_set(5, 0x0B, bytes([1 if target == 'on' else 0]))
+            _info(f'awb: {cur} → {target}')
+        elif cmd == 'anti-flicker':
+            val = AF_MAP.get(args.mode.lower())
+            if val is None: raise ValueError('anti-flicker: auto|50hz|60hz')
+            _uvc_set(5, 0x05, bytes([val]))
+            _info(f'anti-flicker → {args.mode}')
+        elif cmd == 'autofocus':
+            state = args.state
+            _uvc_set(1, 0x08, bytes([1 if state == 'on' else 0]))
+            _info(f'autofocus → {state}')
+
+        # ── AI modes (mutually exclusive video modes via unit 9 sel 2) ────────
+        elif cmd in ('track', 'deskview', 'whiteboard', 'overhead', 'normal'):
+            # Commands with optional on/off/toggle: ON sets the mode, OFF
+            # resets to normal, TOGGLE swaps between current and mode.
+            target_mode = {'track': 'track', 'deskview': 'deskview',
+                           'whiteboard': 'whiteboard', 'overhead': 'overhead',
+                           'normal': 'normal'}[cmd]
+            if cmd == 'normal':
+                write_ai_mode('normal'); _info('mode → normal'); return
+            state = args.state
+            cur = read_ai_mode()
+            if state in (None, 'toggle'):
+                state = 'off' if cur == target_mode else 'on'
+            new_mode = target_mode if state == 'on' else 'normal'
+            write_ai_mode(new_mode)
+            _info(f"{cmd}: {cur} → {new_mode}")
+
+        # ── Smart composition framing ─────────────────────────────────────────
+        elif cmd == 'smartcomp-frame':
+            v = FRAMING_BYTES.get(args.frame)
+            if v is None: raise ValueError('frame: head|halfbody|wholebody')
+            _uvc_set(9, FRAMING_SEL, bytes([v]))
+            _info(f'smartcomp-frame → {args.frame}')
+
+        else:
+            raise ValueError(f'usb_image_dispatch: unexpected {cmd!r}')
+
+    except Exception as e:
+        _warn(f'✗ {cmd} failed: {e}')
+        sys.exit(3)
+
+
+def usb_ptz_dispatch(args) -> None:
+    """Execute PTZ commands directly over USB via uvc-probe — no WebSocket,
+    no Link Controller, no token required. Mirrors linux_ptz_dispatch() but
+    uses our own IOKit ControlRequest path on macOS."""
+    cmd = args.command
+    try:
+        if cmd == 'zoom':
+            if not (100 <= args.value <= 400):
+                _warn('✗ zoom must be 100..400'); sys.exit(1)
+            write_zoom(args.value)
+            _info(f'zoom → {args.value}')
+
+        elif cmd == 'zoom-rel':
+            cur = read_zoom()
+            new = max(100, min(400, cur + args.delta))
+            write_zoom(new)
+            _info(f'zoom: {cur} → {new}')
+
+        elif cmd == 'pan':
+            _, tilt = read_pantilt()
+            write_pantilt(args.value, tilt)
+            _info(f'pan → {args.value}  (tilt unchanged)')
+
+        elif cmd == 'tilt':
+            pan, _ = read_pantilt()
+            write_pantilt(pan, args.value)
+            _info(f'tilt → {args.value}  (pan unchanged)')
+
+        elif cmd == 'pan-rel':
+            pan, tilt = read_pantilt()
+            new_pan = pan + args.steps * USB_PAN_STEP
+            write_pantilt(new_pan, tilt)
+            _info(f'pan: {pan} → {new_pan}  ({args.steps:+d} steps)')
+
+        elif cmd == 'tilt-rel':
+            pan, tilt = read_pantilt()
+            new_tilt = tilt + args.steps * USB_TILT_STEP
+            write_pantilt(pan, new_tilt)
+            _info(f'tilt: {tilt} → {new_tilt}  ({args.steps:+d} steps)')
+
+        elif cmd == 'center':
+            write_pantilt(0, 0)
+            write_zoom(100)
+            _info('centered: pan=0 tilt=0 zoom=100')
+
+        else:
+            raise ValueError(f'usb_ptz_dispatch: unexpected command {cmd!r}')
+    except Exception as e:
+        _warn(f'✗ {cmd} failed: {e}')
+        sys.exit(3)
 
 # ── Preflight: process / USB checks ─────────────────────────────────────────
 
@@ -359,23 +790,36 @@ def _startup_ini_path() -> Path:
 
 STARTUP_INI = _startup_ini_path()
 
-def _read_token_from_ini() -> str | None:
-    """Read the most-recently-used token from startup.ini (case-preserved)."""
+def _read_all_tokens_from_ini() -> list[str]:
+    """Return every token from startup.ini, newest timestamp first.
+
+    The Link Controller keeps multiple tokens in [Token] — some permanently
+    authorized devices (old timestamps), plus ephemeral QR-scan tokens (new
+    timestamps). A token generated for a previous QR session may still be
+    valid even if it's not the newest. When timestamps tie, any of the tied
+    tokens may be the live one; callers should try each until one succeeds.
+    """
     try:
         content = STARTUP_INI.read_text(errors='replace')
         m = re.search(r'\[Token\](.*?)(?:\[|$)', content, re.DOTALL)
         if not m:
-            return None
-        best_token, best_ts = None, 0
+            return []
+        pairs: list[tuple[int, str]] = []
         for line in m.group(1).strip().splitlines():
             if '=' in line:
                 k, v = line.split('=', 1)
                 ts = int(v.strip()) if v.strip().isdigit() else 0
-                if ts > best_ts:
-                    best_ts, best_token = ts, k.strip()
-        return best_token
+                pairs.append((ts, k.strip()))
+        # Sort by timestamp desc so freshest is tried first.
+        pairs.sort(key=lambda p: -p[0])
+        return [t for _, t in pairs]
     except Exception:
-        return None
+        return []
+
+def _read_token_from_ini() -> str | None:
+    """Return the newest token, for callers that only want one (legacy path)."""
+    tokens = _read_all_tokens_from_ini()
+    return tokens[0] if tokens else None
 
 def _controller_running() -> bool:
     system = platform.system()
@@ -659,20 +1103,52 @@ class LinkClient:
 
 # ── Full connect-handshake-command-disconnect flow ───────────────────────────
 
+async def _connect_with_token_cycling(
+    port: int, debug: bool = False
+) -> tuple["LinkClient | None", str]:
+    """Open a WS connection and handshake, cycling through every token in
+    startup.ini (newest timestamp first) until one is accepted.
+
+    Tokens can tie on timestamp — after the Link Controller app restarts it
+    trims the [Token] list and reuses a uniform timestamp — so picking only
+    the "newest" token by naive max-ts is brittle. Returns an open+
+    handshook client on success, or (None, error_message) on failure.
+    """
+    tokens = _read_all_tokens_from_ini() or [""]
+    last_err = ""
+    for i, token in enumerate(tokens):
+        client = LinkClient(port, debug=debug, token=token)
+        try:
+            await client.connect()
+        except Exception as e:
+            return None, f"Could not connect to WebSocket on port {port}: {e}"
+
+        ok, err = await client.handshake()
+        if ok:
+            if debug and i > 0:
+                _dbg(f'token[{i}] of {len(tokens)} accepted')
+            return client, ''
+
+        await client.close()
+        last_err = err
+        # Only keep cycling on token-auth failures; other errors (another
+        # connection holds the slot, network drop, etc.) won't be fixed by
+        # trying a different token.
+        if 'token invalid' not in err.lower():
+            return None, err
+
+    return None, (
+        f"{last_err} — tried {len(tokens)} token(s) from startup.ini. "
+        "Open the Link Controller app's QR code screen to regenerate a "
+        "token, or reconnect the mobile web remote once."
+    )
+
+
 async def _run(port: int, payloads: list, debug: bool = False) -> int:
     """Connect, handshake, send payload(s), disconnect. Returns exit code."""
-    client = LinkClient(port, debug=debug)
-    try:
-        await client.connect()
-    except Exception as e:
-        _warn(f"✗ Could not connect to WebSocket on port {port}: {e}")
-        invalidate_port_cache()
-        return 3
-
-    ok, err = await client.handshake()
-    if not ok:
+    client, err = await _connect_with_token_cycling(port, debug=debug)
+    if client is None:
         _warn(f"✗ {err}")
-        await client.close()
         invalidate_port_cache()
         return 3
 
@@ -837,17 +1313,9 @@ async def cmd_discover(verbose: bool = False, debug: bool = False, port_override
 # ── cmd: status ──────────────────────────────────────────────────────────────
 
 async def cmd_status(port: int, debug: bool = False):
-    client = LinkClient(port, debug=debug)
-    try:
-        await client.connect()
-    except Exception as e:
-        print(f"✗ Connection failed: {e}", file=sys.stderr)
-        sys.exit(3)
-
-    ok, err = await client.handshake()
-    if not ok:
+    client, err = await _connect_with_token_cycling(port, debug=debug)
+    if client is None:
         print(f"✗ {err}", file=sys.stderr)
-        await client.close()
         sys.exit(3)
 
     state = load_state()
@@ -890,15 +1358,6 @@ def linux_ptz_dispatch(args):
         _v4l2('--set-ctrl', 'pan_absolute=0')
         _v4l2('--set-ctrl', 'tilt_absolute=0')
         _v4l2('--set-ctrl', 'zoom_absolute=100')
-    elif cmd == 'privacy':
-        target = args.state
-        if target is None:
-            state = load_state()
-            target = 'off' if state.get('tilt', 0) == -277920 else 'on'
-        if target == 'on':
-            _v4l2('--set-ctrl', 'tilt_absolute=-277920')
-        else:
-            _v4l2('--set-ctrl', 'tilt_absolute=0')
     elif cmd == 'zoom-rel':
         state = load_state()
         cur = state.get('zoom', 100)
@@ -919,21 +1378,11 @@ async def dispatch(args, port: int, debug: bool):
         return
 
     # ── Build payload(s) ─────────────────────────────────────────────────────
-    # We use a dummy serial here; will be replaced with the real one after
-    # handshake. We connect first, then rebuild.
-
-    client = LinkClient(port, debug=debug)
-    try:
-        await client.connect()
-    except Exception as e:
-        _warn(f"✗ Could not connect to WebSocket on port {port}: {e}")
-        invalidate_port_cache()
-        sys.exit(3)
-
-    ok, err = await client.handshake()
-    if not ok:
+    # Connect + handshake, cycling through every candidate token. We rebuild
+    # serial-dependent payloads after the handshake returns the live serial.
+    client, err = await _connect_with_token_cycling(port, debug=debug)
+    if client is None:
         _warn(f"✗ {err}")
-        await client.close()
         invalidate_port_cache()
         sys.exit(3)
 
@@ -1012,27 +1461,12 @@ async def dispatch(args, port: int, debug: bool):
         payloads.append(build_zoom(serial, 100))
         state['pan'] = 0; state['tilt'] = 0; state['zoom'] = 100
 
-    # ── Privacy (velocity-based tilt-down pulse; off = NORMAL_RESET) ──────────
-    elif cmd == 'privacy':
-        target = args.state
-        if target in (None, 'toggle'):
-            target = 'off' if state.get('tilt', 0) == -277920 else 'on'
-        _info(f"privacy: → {target}")
-        if target == 'on':
-            # Center first so we always start from a known position, then tilt
-            # full-speed down for 4 s — enough to reach the bottom stop from center.
-            await client._send(build_value_change(serial, ParamTypeV2.NORMAL_RESET))
-            await asyncio.sleep(0.5)
-            await client._send(build_joystick(serial, 0.0, -1.0))
-            await asyncio.sleep(4.0)
-            await client._send(build_joystick_stop(serial))
-            state['tilt'] = -277920
-            await client.close()
-            save_state(state)
-            return
-        else:
-            payloads.append(build_value_change(serial, ParamTypeV2.NORMAL_RESET))
-            state['tilt'] = 0
+    # `privacy` used to live here as a velocity-based tilt-down pulse. It was
+    # removed because on the original Link it could never be real privacy —
+    # the LED stays on, the sensor keeps streaming, other apps still see the
+    # feed. Pointing the camera at the ceiling gives a false sense of
+    # security. Users who actually want the camera off should use a physical
+    # lens cover, or the (sudo-requiring) USB suspend path when we ship it.
 
     # ── AI modes (all use paramType=5 with AIMode enum value) ─────────────────
     elif cmd == 'track':
@@ -1092,6 +1526,23 @@ async def dispatch(args, port: int, debug: bool):
         _info(f"preset {idx}: save")
         payloads.append(build_preset_save(serial, idx))
 
+    elif cmd == 'preset-add':
+        # Alias for preset-save (both are type=0 ADD); kept for explicitness.
+        idx = args.index
+        if not (0 <= idx <= 19):
+            _warn("✗ preset index must be 0-19")
+            await client.close(); sys.exit(1)
+        _info(f"preset {idx}: add")
+        payloads.append(build_preset_save(serial, idx))
+
+    elif cmd == 'preset-update':
+        idx = args.index
+        if not (0 <= idx <= 19):
+            _warn("✗ preset index must be 0-19")
+            await client.close(); sys.exit(1)
+        _info(f"preset {idx}: update")
+        payloads.append(build_preset_update(serial, idx))
+
     elif cmd == 'preset-delete':
         idx = args.index
         if not (0 <= idx <= 19):
@@ -1099,6 +1550,18 @@ async def dispatch(args, port: int, debug: bool):
             await client.close(); sys.exit(1)
         _info(f"preset {idx}: delete")
         payloads.append(build_preset_delete(serial, idx))
+
+    elif cmd == 'preset-rename':
+        idx = args.index
+        if not (0 <= idx <= 19):
+            _warn("✗ preset index must be 0-19")
+            await client.close(); sys.exit(1)
+        name = args.name
+        if not name:
+            _warn("✗ preset name cannot be empty")
+            await client.close(); sys.exit(1)
+        _info(f"preset {idx}: rename → {name!r}")
+        payloads.append(build_preset_rename(serial, idx, name))
 
     # ── Image / camera settings ───────────────────────────────────────────────
     elif cmd == 'hdr':
@@ -1237,6 +1700,263 @@ async def dispatch(args, port: int, debug: bool):
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
+# ── Interactive joystick (curses) ────────────────────────────────────────────
+
+def interactive_joystick():
+    """Full-screen curses joystick. Arrow keys pan/tilt, +/- zoom, digit keys
+    recall presets, `s` saves a preset, `n` renames, `d` deletes, `q` quits.
+
+    Uses the same USB direct PTZ + preset storage as the `preset-*` commands
+    so saves made here show up in `preset list` and vice versa.
+    """
+    import curses
+
+    if not _uvc_probe_available():
+        _warn("✗ interactive joystick requires tools/uvc-probe (macOS).")
+        _warn("  Compile it: clang -o tools/uvc-probe tools/uvc-probe.m "
+              "-framework IOKit -framework CoreFoundation "
+              "-framework Foundation -ObjC")
+        sys.exit(1)
+
+    # Step sizes — tuned from empirical range of the Link's XU pan/tilt
+    # readback (roughly ±150000 each axis). Shift+arrow uses FAST_MULT to
+    # compensate for terminals that don't auto-repeat modifier+arrow combos
+    # (macOS Terminal.app doesn't; iTerm2 does) — one fast press covers
+    # about 20% of the full range, which is visible and hard to miss.
+    PAN_STEP  = 3000
+    TILT_STEP = 3000
+    FAST_MULT = 5
+    ZOOM_STEP = 10
+
+    def draw(scr, pan, tilt, zoom, presets, status, last_dir, fast_mode):
+        scr.erase()
+        h, w = scr.getmaxyx()
+        title = 'link-ctl joystick  —  USB-direct, no app, no token'
+        scr.addstr(0, max(0, (w - len(title)) // 2), title, curses.A_BOLD)
+        mode = '  [FAST]' if fast_mode else ''
+        scr.addstr(2, 2, f'pan  = {pan:>+8d}    tilt = {tilt:>+8d}    zoom = {zoom:>4d}{mode}',
+                   curses.A_BOLD if fast_mode else curses.A_NORMAL)
+
+        # Crosshair box with directional arrows on all 4 sides. The arrow
+        # matching the most-recent keypress is rendered in reverse video so
+        # the user sees which way the camera just moved.
+        box_top, box_left, box_h, box_w = 6, 6, 9, 25
+        box_cy = box_top + (box_h - 2) // 2
+        box_cx = box_left + box_w // 2
+
+        def arrow(y, x, glyph, d):
+            attr = curses.A_REVERSE | curses.A_BOLD if last_dir == d else curses.A_DIM
+            scr.addstr(y, x, glyph, attr)
+
+        arrow(box_top - 2,            box_cx, '▲', 'up')
+        arrow(box_top + box_h - 1,    box_cx, '▼', 'down')
+        arrow(box_cy,                 box_left - 3, '◀', 'left')
+        arrow(box_cy,                 box_left + box_w + 1, '▶', 'right')
+
+        scr.addstr(box_top - 1, box_left, '┌' + '─' * (box_w - 2) + '┐')
+        for i in range(box_h - 2):
+            scr.addstr(box_top + i, box_left, '│' + ' ' * (box_w - 2) + '│')
+        scr.addstr(box_top + box_h - 2, box_left, '└' + '─' * (box_w - 2) + '┘')
+        # position indicator — map pan/tilt into the box (bounds ~±150000)
+        PX_BOUND = 150000
+        cx = box_left + 1 + int((box_w - 3) * (pan + PX_BOUND) / (2 * PX_BOUND))
+        cy = box_top + int((box_h - 3) * (PX_BOUND - tilt) / (2 * PX_BOUND))
+        cx = max(box_left + 1, min(box_left + box_w - 2, cx))
+        cy = max(box_top, min(box_top + box_h - 3, cy))
+        scr.addstr(cy, cx, '✚')
+
+        # preset table
+        scr.addstr(box_top + box_h + 1, 2, 'presets:', curses.A_UNDERLINE)
+        for i, p in enumerate(presets[:10]):
+            line = f"  {p['id']}  {p['name']:<16s}  pan={p['pan']:>+7d} tilt={p['tilt']:>+7d} zoom={p['zoom']}"
+            if box_top + box_h + 2 + i < h - 3:
+                scr.addstr(box_top + box_h + 2 + i, 2, line[: w - 4])
+
+        # keybinds
+        binds = [
+            'arrows  pan/tilt',
+            'f  toggle fast (5×)',
+            '+/-  zoom',
+            '0-9  recall preset',
+            's  save preset',
+            'n  rename',
+            'd  delete',
+            'c  center',
+            'q  quit',
+        ]
+        for i, b in enumerate(binds):
+            if h - 2 - len(binds) + i > 0:
+                scr.addstr(h - 2 - len(binds) + i, max(2, w - 30), b)
+
+        if status:
+            scr.addstr(h - 1, 2, status[: w - 4], curses.A_REVERSE)
+        scr.refresh()
+
+    def prompt(scr, prompt_str, default=''):
+        curses.echo()
+        h, w = scr.getmaxyx()
+        scr.addstr(h - 1, 0, ' ' * (w - 1))
+        scr.addstr(h - 1, 0, prompt_str + ' ')
+        scr.refresh()
+        try:
+            ans = scr.getstr(h - 1, len(prompt_str) + 1, w - len(prompt_str) - 2).decode()
+        except Exception:
+            ans = ''
+        curses.noecho()
+        return ans.strip() or default
+
+    def run(scr):
+        curses.curs_set(0)
+        scr.keypad(True)
+
+        try:
+            pan, tilt = read_pantilt()
+            zoom = read_zoom()
+        except Exception as e:
+            scr.addstr(0, 0, f'error reading camera: {e}')
+            scr.getch()
+            return
+        status = 'ready'
+        last_dir = None        # which arrow glyph to highlight
+        last_key_time = 0.0    # wall-clock of last arrow keystroke
+        HIGHLIGHT_MS = 150     # decay window — key-repeat is ~30-50ms on macOS
+        fast_mode = False      # `f` toggles; terminals that don't distinguish
+                               # shift+arrow from plain arrow (macOS Terminal.app)
+                               # still get fast-mode via this toggle.
+
+        # Non-blocking getch: returns -1 if no key within `timeout` ms, so we
+        # can decay the highlight shortly after the user releases the key.
+        scr.timeout(30)
+
+        last_raw_seq = ['']   # debug: last raw escape sequence seen
+        def drain_escape_sequence():
+            """Drain remaining bytes of a CSI sequence whose leading ESC we
+            just peeked. Returns ('up'|'down'|'left'|'right', fast_flag) if
+            recognised, else (None, False). Shift+arrow on most terminals is
+            ESC [ 1 ; 2 A/B/C/D; plain arrow when keypad() doesn't intercept
+            is ESC [ A/B/C/D."""
+            buf = []
+            scr.timeout(8)
+            for _ in range(8):
+                k = scr.getch()
+                if k == -1: break
+                buf.append(k)
+            scr.timeout(30)
+            s = bytes(b & 0xff for b in buf).decode('latin-1', errors='replace')
+            last_raw_seq[0] = 'ESC' + repr(s)
+            m = re.match(r'\[(\d+)?(?:;(\d+))?([ABCD])', s)
+            if not m: return (None, False)
+            mod = int(m.group(2) or 1)   # 1=none, 2=shift, 3=alt, 4=shift+alt, 5=ctrl…
+            d = {'A': 'up', 'B': 'down', 'C': 'right', 'D': 'left'}[m.group(3)]
+            return (d, mod == 2)
+
+        while True:
+            now = time.time()
+            if last_dir and (now - last_key_time) * 1000 > HIGHLIGHT_MS:
+                last_dir = None
+            presets = usb_preset_list()
+            draw(scr, pan, tilt, zoom, presets, status, last_dir, fast_mode)
+            c = scr.getch()
+            if c == -1:
+                continue       # no key this tick — loop and let highlight decay
+            dp = dt = dz = 0
+            shift = False
+            mult = FAST_MULT if fast_mode else 1
+            shift = fast_mode
+            # ESC-prefixed escape sequences. On terminals that report
+            # modifiers (iTerm2), shift+arrow arrives here and we use its
+            # modifier flag directly; on plain Terminal.app it's just ESC[A
+            # and we fall back to fast_mode state.
+            if c == 27:
+                d, term_shift = drain_escape_sequence()
+                if d is None:
+                    continue
+                if term_shift:
+                    mult = FAST_MULT; shift = True
+                if d == 'left':    dp = -PAN_STEP * mult
+                elif d == 'right': dp = +PAN_STEP * mult
+                elif d == 'up':    dt = +TILT_STEP * mult
+                elif d == 'down':  dt = -TILT_STEP * mult
+                last_dir = d; last_key_time = now
+            elif c == curses.KEY_LEFT:   dp = -PAN_STEP * mult;  last_dir = 'left';  last_key_time = now
+            elif c == curses.KEY_RIGHT: dp = +PAN_STEP * mult; last_dir = 'right'; last_key_time = now
+            elif c == curses.KEY_UP:    dt = +TILT_STEP * mult; last_dir = 'up';   last_key_time = now
+            elif c == curses.KEY_DOWN:  dt = -TILT_STEP * mult; last_dir = 'down'; last_key_time = now
+            # curses KEY_S* constants (shift-arrow) for terminals that map them
+            elif c == curses.KEY_SLEFT:  dp = -PAN_STEP * FAST_MULT; shift = True; last_dir = 'left';  last_key_time = now
+            elif c == curses.KEY_SRIGHT: dp = +PAN_STEP * FAST_MULT; shift = True; last_dir = 'right'; last_key_time = now
+            elif c == ord('f'):
+                fast_mode = not fast_mode
+                status = f"fast mode: {'ON (5×)' if fast_mode else 'off'}"
+                continue
+            elif c in (ord('+'), ord('=')): dz = +ZOOM_STEP
+            elif c in (ord('-'), ord('_')): dz = -ZOOM_STEP
+            elif c == ord('c'):
+                pan, tilt, zoom = 0, 0, 100
+                try:
+                    write_pantilt(pan, tilt); write_zoom(zoom)
+                    status = 'centered'
+                except Exception as e: status = f'center failed: {e}'
+                continue
+            elif c == ord('q'):
+                return
+            elif c == ord('s'):
+                idx = prompt(scr, 'save to slot (0-9):')
+                if idx.isdigit() and 0 <= int(idx) <= 9:
+                    name = prompt(scr, f'name for slot {idx}:', f'preset_{idx}')
+                    try:
+                        e = usb_preset_save(int(idx), name)
+                        status = f"saved slot {idx} '{e['name']}'"
+                    except Exception as err: status = f'save failed: {err}'
+                continue
+            elif c == ord('n'):
+                idx = prompt(scr, 'rename slot (0-9):')
+                if idx.isdigit() and 0 <= int(idx) <= 9:
+                    name = prompt(scr, 'new name:')
+                    try:
+                        usb_preset_rename(int(idx), name)
+                        status = f'renamed slot {idx} to {name!r}'
+                    except KeyError: status = f'no preset at slot {idx}'
+                continue
+            elif c == ord('d'):
+                idx = prompt(scr, 'delete slot (0-9):')
+                if idx.isdigit() and 0 <= int(idx) <= 9:
+                    ok = usb_preset_delete(int(idx))
+                    status = f'deleted slot {idx}' if ok else f'no preset at {idx}'
+                continue
+            elif ord('0') <= c <= ord('9'):
+                idx = c - ord('0')
+                try:
+                    e = usb_preset_recall(idx)
+                    pan, tilt, zoom = e['pan'], e['tilt'], e['zoom']
+                    status = f"recalled slot {idx} '{e['name']}'"
+                except KeyError: status = f'no preset at slot {idx}'
+                except Exception as err: status = f'recall failed: {err}'
+                continue
+            else:
+                continue
+
+            if dp or dt:
+                pan += dp; tilt += dt
+                try:
+                    write_pantilt(pan, tilt)
+                    step = f'{FAST_MULT}×' if shift else '1×'
+                    seq = f'  raw={last_raw_seq[0]}' if last_raw_seq[0] else ''
+                    status = f"[{step}] move → pan={pan} tilt={tilt}{seq}"
+                    last_raw_seq[0] = ''
+                except Exception as e: status = f'move failed: {e}'
+            if dz:
+                new_zoom = max(100, min(400, zoom + dz))
+                if new_zoom != zoom:
+                    zoom = new_zoom
+                    try:
+                        write_zoom(zoom)
+                        status = f'zoom → {zoom}'
+                    except Exception as e: status = f'zoom failed: {e}'
+
+    curses.wrapper(run)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog='link-ctl',
@@ -1249,16 +1969,15 @@ def build_parser() -> argparse.ArgumentParser:
   zoom     <100-400>      absolute zoom
   zoom-rel <delta>        relative zoom  (e.g. +50 or -50)
   center                  reset pan, tilt, and zoom to defaults
-  privacy  [on|off|toggle]  tilt lens straight down / restore
 
-  ── AI modes  (macOS/Windows only) ─────────────────────────────────
+  ── AI modes  (USB-direct on macOS; WS elsewhere) ──────────────────
   track        [on|off|toggle]   subject tracking
   deskview     [on|off|toggle]   desk surface view
   whiteboard   [on|off|toggle]   whiteboard mode
   overhead     [on|off|toggle]   overhead / top-down view
   normal                         return to standard mode
 
-  ── Image settings  (macOS/Windows only) ────────────────────────────
+  ── Image settings  (USB-direct on macOS; WS elsewhere) ────────────
   hdr              [on|off|toggle]   HDR
   autofocus         on|off           auto focus  (explicit arg required)
   autoexposure     [on|off|toggle]   auto exposure
@@ -1275,10 +1994,18 @@ def build_parser() -> argparse.ArgumentParser:
   exposurecomp <0-100>   exposure compensation (50 = 0 EV)
   wb-temp  <2800-10000>  white balance temperature in Kelvin (AWB must be off)
 
-  ── Presets ─────────────────────────────────────────────────────────
-  preset        <0-19>   recall saved preset position
-  preset-save   <0-19>   save current position as preset
-  preset-delete <0-19>   delete a preset slot
+  ── Presets (USB-direct on macOS; WebSocket elsewhere) ─────────────
+  preset          <0-19>        recall saved preset
+  preset-save     <0-19> [name] save current pan/tilt/zoom as preset
+  preset-recall   <0-19>        alias for preset
+  preset-add      <0-19>        WS path only — alias for preset-save (ADD)
+  preset-update   <0-19>        WS path only — overwrite existing (UPDATE)
+  preset-rename   <0-19> <name> rename a preset
+  preset-delete   <0-19>        delete a preset
+  preset-list                   list saved presets (USB path only)
+
+  ── Interactive (USB-direct, macOS only) ──────────────────────────
+  joystick                      curses-based PTZ + preset UI
 
   ── Diagnostics ─────────────────────────────────────────────────────
   status                 show device info as JSON
@@ -1306,8 +2033,6 @@ toggle commands: omit the argument to smart-toggle based on current state
     s = sub.add_parser('zoom-rel');  s.add_argument('delta', type=int)
     sub.add_parser('center')
 
-    # Privacy
-    s = sub.add_parser('privacy');   s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle'])
 
     # AI modes
     s = sub.add_parser('track');     s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle'])
@@ -1316,10 +2041,27 @@ toggle commands: omit the argument to smart-toggle based on current state
     s = sub.add_parser('overhead');  s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle'])
     sub.add_parser('normal')
 
-    # Presets
-    s = sub.add_parser('preset');        s.add_argument('index', type=int)
-    s = sub.add_parser('preset-save');   s.add_argument('index', type=int)
-    s = sub.add_parser('preset-delete'); s.add_argument('index', type=int)
+    # Presets. When tools/uvc-probe is available (macOS), these go through the
+    # USB-direct path (host-side JSON storage + standard UVC PTZ). Otherwise
+    # they fall back to the WebSocket PresetUpdateRequest path.
+    s = sub.add_parser('preset');         s.add_argument('index', type=int)
+    s = sub.add_parser('preset-save')
+    s.add_argument('index', type=int)
+    s.add_argument('name', type=str, nargs='?', default=None,
+                   help='optional name (USB path only; WS path ignores)')
+    s = sub.add_parser('preset-recall');  s.add_argument('index', type=int)
+    s = sub.add_parser('preset-add');     s.add_argument('index', type=int)
+    s = sub.add_parser('preset-update');  s.add_argument('index', type=int)
+    s = sub.add_parser('preset-delete');  s.add_argument('index', type=int)
+    s = sub.add_parser('preset-rename')
+    s.add_argument('index', type=int)
+    s.add_argument('name', type=str)
+    s = sub.add_parser('preset-list',
+                       help='list saved presets (USB path only)')
+    s.add_argument('--json', action='store_true')
+
+    # Interactive curses joystick (USB-direct; macOS only)
+    sub.add_parser('joystick', help='interactive curses PTZ + preset UI')
 
     # Image settings
     s = sub.add_parser('hdr');              s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle'])
@@ -1375,6 +2117,78 @@ def main():
         asyncio.run(cmd_preflight_check(debug=debug, port_override=args.port))
         return
 
+    # ── USB-direct commands (no WebSocket, no Link Controller, no token) ──────
+    if cmd == 'joystick':
+        interactive_joystick()
+        return
+
+    # Full PTZ over USB when uvc-probe is available. On Linux we still prefer
+    # v4l2-ctl (standard UVC ioctl); on macOS uvc-probe is the only option.
+    USB_PTZ_CMDS = {'zoom', 'zoom-rel', 'pan', 'tilt', 'pan-rel', 'tilt-rel',
+                    'center'}
+    if cmd in USB_PTZ_CMDS and _uvc_probe_available():
+        usb_ptz_dispatch(args)
+        return
+
+    # Image / AI controls over USB — fully frees the CLI from the desktop
+    # app for every user-facing control. Firmware update, device rename,
+    # and factory reset still require the desktop app (they aren't exposed
+    # as XU selectors we can discover).
+    # smartcomposition (on/off master) is intentionally NOT in the USB set —
+    # its XU bit hasn't been confirmed, so the command still falls through
+    # to the WebSocket path (paramType 11). smartcomp-frame (head/half/full)
+    # IS USB-direct since that selector is documented.
+    USB_IMG_CMDS = {'hdr', 'mirror', 'gesture-zoom',
+                    'brightness', 'contrast', 'saturation', 'sharpness',
+                    'wb-temp', 'exposurecomp', 'autoexposure', 'awb',
+                    'anti-flicker', 'autofocus',
+                    'track', 'deskview', 'whiteboard', 'overhead', 'normal',
+                    'smartcomp-frame'}
+    if cmd in USB_IMG_CMDS and _uvc_probe_available():
+        usb_image_dispatch(args)
+        return
+
+    if cmd in {'preset', 'preset-save', 'preset-recall', 'preset-delete',
+               'preset-rename', 'preset-list'} and _uvc_probe_available():
+        try:
+            if cmd == 'preset-list':
+                lst = usb_preset_list()
+                if args.json:
+                    print(json.dumps(lst, indent=2))
+                elif not lst:
+                    _info('(no presets saved)')
+                else:
+                    for p in lst:
+                        print(f"{p['id']:>2}  {p['name']:<16s}  "
+                              f"pan={p['pan']:>+7d}  tilt={p['tilt']:>+7d}  zoom={p['zoom']}")
+                return
+            if cmd in {'preset', 'preset-recall'}:
+                e = usb_preset_recall(args.index)
+                _info(f"recalled slot {args.index} '{e['name']}' → "
+                      f"pan={e['pan']} tilt={e['tilt']} zoom={e['zoom']}")
+                return
+            if cmd == 'preset-save':
+                name = getattr(args, 'name', None)
+                e = usb_preset_save(args.index, name)
+                _info(f"saved slot {args.index} '{e['name']}' ← "
+                      f"pan={e['pan']} tilt={e['tilt']} zoom={e['zoom']}")
+                return
+            if cmd == 'preset-delete':
+                ok = usb_preset_delete(args.index)
+                _info(f"deleted slot {args.index}" if ok else
+                      f"(slot {args.index} was empty)")
+                return
+            if cmd == 'preset-rename':
+                e = usb_preset_rename(args.index, args.name)
+                _info(f"renamed slot {args.index} → {e['name']!r}")
+                return
+        except KeyError as e:
+            _warn(f'✗ {e}')
+            sys.exit(1)
+        except Exception as e:
+            _warn(f'✗ USB preset {cmd} failed: {e}')
+            sys.exit(3)
+
     # ── Platform-specific AI mode restriction ─────────────────────────────────
     AI_CMDS = {'track', 'deskview', 'whiteboard', 'overhead', 'normal'}
     if system == 'Linux' and cmd in AI_CMDS:
@@ -1382,7 +2196,7 @@ def main():
         sys.exit(4)
 
     # ── Linux PTZ via v4l2-ctl ────────────────────────────────────────────────
-    PTZ_CMDS = {'pan', 'tilt', 'pan-rel', 'tilt-rel', 'zoom', 'zoom-rel', 'center', 'privacy'}
+    PTZ_CMDS = {'pan', 'tilt', 'pan-rel', 'tilt-rel', 'zoom', 'zoom-rel', 'center'}
     if system == 'Linux' and cmd in PTZ_CMDS:
         linux_ptz_dispatch(args)
         return

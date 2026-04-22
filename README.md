@@ -14,27 +14,75 @@ leaving original Link owners with a suggestion to use global hotkeys instead.
 
 That's a reasonable workaround, but it felt like a miss for people who had invested in the
 original hardware. The Link Controller app already exposes a local WebSocket API for its
-mobile remote — all the capability was there. This tool uses it.
+mobile remote — the first version of this tool used that path.
+
+In **v2.0** the tool goes a step further: on macOS it talks to the camera **directly over
+USB** using the same UVC Extension Unit registers the desktop app itself uses. You no
+longer need the Link Controller app running at all for PTZ, presets, or image/AI
+settings. No WebSocket, no token, no `sudo`, no code signing.
 
 If you have an OG Link and want proper automation, Stream Deck support, or scripting,
 this is for you. Connecting software you own to hardware you own is [something worth protecting](https://www.eff.org/deeplinks/2019/10/adversarial-interoperability).
 
 ---
 
+## What's new in v2.1
+
+- **Pure-Python IOKit access.** The USB-direct backend on macOS is now
+  `link_usb_macos.py` — a ~250-line ctypes module that calls `IOKit`
+  directly from Python. **No external binary** is needed at runtime;
+  `tools/uvc-probe` is kept as a CLI debugging tool and as a subprocess
+  fallback, but it's no longer on the hot path.
+- **12× faster.** Per-call latency went from ~6 ms (subprocess) to ~0.5 ms
+  (in-process). The interactive `joystick` UI is visibly snappier and
+  tight loops (e.g. `pan-rel` spam from a Stream Deck) no longer stutter.
+- **Library-first.** `import link_ctl; link_ctl.write_pantilt(0, 0)` now
+  does all its work in-process — no subprocess, no external dependency —
+  making link-ctl viable as a real Python library, not just a CLI.
+
+## What's new in v2.0
+
+- **USB-direct control on macOS.** PTZ, presets, AI modes, image settings, and interactive
+  joystick all work without the Link Controller desktop app running. The tool speaks
+  directly to the camera's UVC Extension Unit registers via a small IOKit helper
+  (`tools/uvc-probe`) that needs no `sudo`, no entitlements, and no code signing —
+  thanks to the "never open the interface" pattern from
+  [jtfrey/uvc-util](https://github.com/jtfrey/uvc-util).
+- **Interactive `joystick` mode.** Full-screen curses UI: arrow keys pan/tilt, `+`/`-`
+  zoom, `f` toggles 5× fast-mode, digits `0-9` recall presets, `s`/`n`/`d` save/
+  rename/delete presets, `c` centers. Built for quick manual framing.
+- **Host-side presets.** `preset-save`, `preset-recall`, `preset-rename`, `preset-delete`,
+  `preset-list` store camera position in `~/.config/link-ctl/presets.json` — 10 slots
+  with user-named entries. Survives Link Controller restarts because they don't live in
+  the app. See [Presets](#presets) for the file format.
+- **Removed `privacy` command.** On the original Link it was always theatre — the LED
+  stayed on, the sensor kept streaming, other apps still saw the feed. Use a physical
+  lens cover for real privacy, or the Link 2C's built-in shutter.
+- **Fix: `preset-save` now actually saves** (was silently `success=0 reason=0` on empty
+  slots in v1.x because it sent `UPDATE` instead of `ADD`).
+- **New commands**: `preset-recall`, `preset-update`, `preset-list`, `joystick`.
+
+See [CHANGELOG](#whats-new-in-v20) at top, or git history, for the full list.
+
+---
+
 ## Table of Contents
 
+- [What's new in v2.0](#whats-new-in-v20)
 - [Feature Matrix](#feature-matrix)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Commands](#commands)
   - [PTZ Control](#ptz-control)
-  - [Privacy](#privacy)
-  - [AI Modes](#ai-modes-macoswindows-only)
-  - [Image Settings](#image-settings-macoswindows-only)
+  - [AI Modes](#ai-modes)
+  - [Image Settings](#image-settings)
   - [Presets](#presets)
+  - [Interactive Joystick](#interactive-joystick)
   - [Diagnostics](#diagnostics)
   - [Global Flags](#global-flags)
+- [USB-direct vs WebSocket](#usb-direct-vs-websocket)
+- [File Locations](#file-locations)
 - [Preflight Checks](#preflight-checks)
 - [Port Discovery](#port-discovery)
 - [State Cache](#state-cache)
@@ -42,14 +90,16 @@ this is for you. Connecting software you own to hardware you own is [something w
 - [Stream Deck Setup](#stream-deck-setup)
 - [Linux](#linux)
 - [Protocol Notes](#protocol-notes)
-- [Testing & Validation](#testing--validation)
-- [Reverse Engineering the API](#reverse-engineering-the-api)
 - [Development](#development)
 
 ---
 
-CLI tool to control an **Insta360 Link** (original) webcam by communicating
-with the **Insta360 Link Controller** desktop app via its local WebSocket server.
+CLI tool to control an **Insta360 Link** (original) webcam.
+
+On **macOS** the tool talks directly to the camera over USB — no app, no WebSocket.
+On **Windows** and as a fallback on macOS, it uses the Insta360 Link Controller
+desktop app's local WebSocket API. On **Linux** PTZ works via `v4l2-ctl`; image/AI
+settings still need the desktop app (which doesn't run on Linux today).
 
 > **Newer models:** Compatibility with the
 > [Link 2](https://github.com/csmarshall/link-ctl/issues/5),
@@ -57,9 +107,6 @@ with the **Insta360 Link Controller** desktop app via its local WebSocket server
 > [Link 2 Pro](https://github.com/csmarshall/link-ctl/issues/7), and
 > [Link 2C Pro](https://github.com/csmarshall/link-ctl/issues/8)
 > is unverified — if you have one, give it a try and report back!
-
-The Link Controller app must be running — that's expected and fine. You can
-minimize it or disable the preview; the WebSocket server stays active.
 
 ---
 
@@ -69,14 +116,15 @@ Legend: ✅ confirmed + validated · ⚠️ confirmed sent, limited/no readback 
 
 **PTZ**
 
-| UI Feature | CLI Command | paramType | validate.py | Notes |
+| UI Feature | CLI Command | USB-direct (macOS) | WS fallback | Notes |
 |---|---|---|---|---|
-| Zoom | `zoom N` / `zoom-rel ±N` | 4 | ✅ zoom | 100–400 |
-| Pan | `pan-rel N` | 6/7 | — | Velocity pulse; no absolute positioning |
-| Tilt | `tilt-rel N` | 6/7 | — | Velocity pulse |
-| Center/reset | `center` | 3 | — | Resets pan, tilt, and zoom |
-| Privacy | `privacy on\|off\|toggle` | 6/7 | — | Tilt to bottom stop (3.5 s pulse) |
-| Absolute pan/tilt | — | — | — | ❌ v2.2.1 is velocity-only; exits with code 4 |
+| Zoom | `zoom N` / `zoom-rel ±N` | ✅ CT(1) sel 0x0B | ✅ paramType 4 | 100–400, uint16 LE |
+| Pan (absolute) | `pan N` | ✅ CT(1) sel 0x0D | ❌ | USB-direct only (WS is velocity-only) |
+| Tilt (absolute) | `tilt N` | ✅ CT(1) sel 0x0D | ❌ | USB-direct only |
+| Pan (relative) | `pan-rel N` | ✅ | ✅ paramType 6/7 | 1 step = 3000 USB units |
+| Tilt (relative) | `tilt-rel N` | ✅ | ✅ paramType 6/7 | |
+| Center/reset | `center` | ✅ | ✅ paramType 3 | pan=0, tilt=0, zoom=100 |
+| Interactive joystick | `joystick` | ✅ | — | Full-screen curses UI |
 
 **AI Modes**
 
@@ -213,27 +261,23 @@ link-ctl privacy on
 ### PTZ Control
 
 ```bash
-link-ctl pan-rel <steps>   # Relative pan,  -30 .. 30 steps (velocity pulse)
-link-ctl tilt-rel <steps>  # Relative tilt, -30 .. 30 steps (velocity pulse)
-link-ctl zoom <value>      # Absolute zoom:  100 .. 400
+link-ctl pan <N>           # Absolute pan  (USB-direct only; not on WS)
+link-ctl tilt <N>          # Absolute tilt (USB-direct only; not on WS)
+link-ctl pan-rel <steps>   # Relative pan,  -30 .. 30 steps
+link-ctl tilt-rel <steps>  # Relative tilt, -30 .. 30 steps
+link-ctl zoom <value>      # Absolute zoom: 100 .. 400
 link-ctl zoom-rel <delta>  # Relative zoom (e.g. 50 or -50)
-link-ctl center            # Reset pan/tilt to center, zoom to 100
+link-ctl center            # Reset pan=0, tilt=0, zoom=100
 ```
 
-> **Note:** The v2.2.1 WebSocket API is velocity-only for pan/tilt. There is no
-> absolute pan/tilt command via WebSocket. `pan-rel` and `tilt-rel` work by
-> sending a joystick velocity for a calibrated duration.
+**Absolute pan/tilt** is only available on the USB-direct path (macOS with
+`tools/uvc-probe`). The WebSocket API in Link Controller v2.2.1 is
+velocity-only; USB-direct uses the camera's standard UVC
+`CT_PANTILT_ABSOLUTE_CONTROL` (unit 1, selector 0x0D) which accepts an
+8-byte `pan_int32_le + tilt_int32_le` payload. Approximate range is ±150000
+on each axis.
 
-### Privacy
-
-```bash
-link-ctl privacy on        # Tilt lens straight down (privacy position)
-link-ctl privacy off       # Return to center
-link-ctl privacy           # Smart toggle (same as 'toggle')
-link-ctl privacy toggle    # Explicit toggle
-```
-
-### AI Modes _(macOS/Windows only)_
+### AI Modes
 
 All AI mode commands accept `on`, `off`, or `toggle`. Omitting the argument
 smart-toggles based on the current mode.
@@ -246,7 +290,7 @@ link-ctl overhead [on|off|toggle]   # Overhead / top-down
 link-ctl normal                     # Return to standard mode (clears all AI modes)
 ```
 
-### Image Settings _(macOS/Windows only)_
+### Image Settings
 
 Toggle commands accept `on`, `off`, or `toggle`. Omitting the argument
 smart-toggles based on current device state. Exceptions:
@@ -274,11 +318,64 @@ link-ctl gesture-zoom [on|off|toggle]    # Gesture control zoom (toggle defaults
 
 ### Presets
 
+Presets store the camera's `(pan, tilt, zoom)` in a local JSON file. On
+macOS this is USB-direct — no desktop app, no WebSocket. Up to 10 named
+slots (0-9). On Windows / Linux the commands fall back to the WebSocket
+`PresetUpdateRequest` path.
+
 ```bash
-link-ctl preset <0-19>         # Recall a saved preset position
-link-ctl preset-save <0-19>    # Save current position as preset
-link-ctl preset-delete <0-19>  # Delete a preset slot
+link-ctl preset-save <0-9> [name]    # Save current PTZ, name is optional
+link-ctl preset-recall <0-9>         # Move camera back to saved position
+link-ctl preset <0-9>                # Alias for preset-recall
+link-ctl preset-rename <0-9> <name>  # Rename a saved preset
+link-ctl preset-delete <0-9>         # Remove a saved preset
+link-ctl preset-list [--json]        # Show all saved presets
 ```
+
+**Storage path:** `~/.config/link-ctl/presets.json`
+
+**Schema:**
+
+```json
+{
+  "version": 1,
+  "presets": {
+    "0": {"name": "desk",   "pan": 0,     "tilt": 0,     "zoom": 100},
+    "1": {"name": "window", "pan": 45000, "tilt": 60000, "zoom": 200}
+  }
+}
+```
+
+`pan` / `tilt` are signed 32-bit integers in the UVC Extension Unit's native
+units (roughly ±150000 full-range on each axis). `zoom` is an unsigned 16-bit
+integer in the range 100..400 (100 = 1×, 400 = 4×). The file is safe to
+hand-edit or generate from scripts; link-ctl reads it fresh on every command.
+
+### Interactive Joystick
+
+```bash
+link-ctl joystick
+```
+
+Full-screen curses UI with arrow keys for pan/tilt, `+`/`-` for zoom, and
+preset slot bindings. Requires `tools/uvc-probe` (macOS).
+
+```
+  Keys
+    arrows        pan / tilt
+    f             toggle fast mode (5× step)
+    shift+arrow   one-shot fast step (iTerm2 / terminals that send modifiers)
+    +/-           zoom in/out (step 10)
+    0-9           recall preset slot N
+    s             save current position to slot (prompts for slot + name)
+    n             rename a slot (prompts for slot + new name)
+    d             delete a slot
+    c             center (pan=0, tilt=0, zoom=100)
+    q             quit
+```
+
+Saves made in the joystick UI are stored in the same `presets.json` file as
+the `preset-*` CLI commands.
 
 ### Diagnostics
 
@@ -347,7 +444,72 @@ The discovered port is cached automatically.
 ```
 
 `zoom` is read from the device on each connection and used by `zoom-rel` to
-compute the new absolute value.
+compute the new absolute value (on the WebSocket path).
+
+---
+
+## USB-direct vs WebSocket
+
+Every command inside `link-ctl` picks one of two paths at runtime based on
+platform and whether `tools/uvc-probe` is available:
+
+| Platform | PTZ | Presets | AI modes / image | Fallback |
+|---|---|---|---|---|
+| **macOS** + `tools/uvc-probe` present | USB-direct | USB-direct | USB-direct | — |
+| **macOS** without uvc-probe | WS | WS | WS | Link Controller app must be running |
+| **Windows** | WS | WS | WS | Link Controller app must be running |
+| **Linux** | `v4l2-ctl` | WS (if Link Controller is somehow running) | WS | image/AI only works with the app |
+
+The `uvc-probe` binary is compiled from `tools/uvc-probe.m` (Objective-C /
+IOKit, ~350 lines) and bundled with the Homebrew formula and the release
+tarballs. It uses the "never open the interface" technique from
+[jtfrey/uvc-util](https://github.com/jtfrey/uvc-util) so it needs no `sudo`,
+no `com.apple.security.device.usb` entitlement, and no codesigning step —
+just `clang` and run.
+
+If you want to force the WebSocket path temporarily (e.g. to compare
+behaviour), rename `tools/uvc-probe` out of the way and re-run.
+
+---
+
+## File Locations
+
+| Path | Purpose |
+|---|---|
+| `~/.config/link-ctl/state.json` | Discovered WS port cache + last-known zoom |
+| `~/.config/link-ctl/presets.json` | USB-direct preset definitions (10 slots, JSON) |
+| `~/Library/Application Support/Insta360 Link Controller/startup.ini` | Link Controller app's WS auth token (used only by the WS fallback) |
+| `tools/uvc-probe` | IOKit helper (macOS) — compile from `tools/uvc-probe.m` |
+| `tools/usb-suspend` | USB suspend helper for real camera-off; needs sudo (not used by default) |
+
+---
+
+## Using as a Python library
+
+`link_ctl.py` is a single-module library — its top-level functions are the
+same ones the CLI dispatcher calls internally. You can import and use them
+from your own scripts:
+
+```python
+import link_ctl as lc
+
+pan, tilt = lc.read_pantilt()     # current position
+zoom = lc.read_zoom()             # 100..400
+lc.write_pantilt(0, 0)            # center
+lc.write_zoom(200)                # 2× zoom
+lc.write_ai_mode('track')         # enable AI tracking
+lc.write_ai_mode('normal')        # back to normal
+
+# Host-side presets (same JSON file as the CLI)
+lc.usb_preset_save(3, name='desk')
+info = lc.usb_preset_recall(3)    # → {'name': 'desk', 'pan': 0, 'tilt': 0, 'zoom': 100}
+lc.usb_preset_list()              # all slots
+```
+
+All the USB-direct functions above require `tools/uvc-probe` to be reachable
+from the working directory. A clean `link_ctl` package (submodules for
+`usb`, `ws`, `presets`, `cli`) is planned for a future release — the current
+module-level API is stable for v2.x.
 
 ---
 
@@ -476,359 +638,7 @@ Reference: <https://dt.in.th/Insta360LinkControllerWebSocketProtocol>
 
 ---
 
-## Testing & Validation
-
-Two scripts support protocol testing and future re-mapping.
-
-### validate.py — Live command validator
-
-Sends each known command, reads device state before and after via a fresh
-WebSocket handshake, and reports PASS/FAIL. No tshark or sudo required.
-
-**Prerequisites:**
-- Camera connected via USB, Link Controller running
-- No mobile web remote open (only one controller at a time)
-- `websockets` installed in the Python you run it with
-
-```bash
-# Run all tests
-python3 validate.py
-
-# From a QR code URL (extracts port + token automatically)
-python3 validate.py "http://link-controller.insta360.com/v3/link/?port=49924&token=..."
-
-# List all test names
-python3 validate.py --list
-
-# Run specific tests
-python3 validate.py --only zoom --only hdr
-
-# Skip a test
-python3 validate.py --skip overhead
-```
-
-Tests: `zoom`, `track`, `overhead`, `deskview`, `whiteboard`, `hdr`,
-`brightness`, `contrast`, `saturation`, `sharpness`, `exposurecomp`, `autoexposure`,
-`awb`, `wb-temp`, `preset-save`, `preset`, `preset-delete` (17 total)
-
-Each test sends the command, reconnects to read the updated device state, asserts
-the expected field changed, then restores the original value.
-
-### apitest.py — Protocol capture exerciser
-
-Drives every known command in sequence with millisecond-precision timestamps,
-for correlating against a simultaneous `tshark` packet capture. Use this when
-you need to re-discover paramType assignments after a firmware update.
-
-**Prerequisites (in addition to validate.py prerequisites):**
-- `sudo` access to run tshark
-
-```bash
-# 1. Start tshark (in a separate terminal)
-sudo tshark -i lo0 -Y "websocket" -T fields \
-    -e frame.time_relative -e data.data \
-    -E header=y > ~/apitest-capture.txt
-
-# 2. Run the exerciser (press Enter when tshark is running)
-python3 apitest.py
-
-# 3. Ctrl-C tshark when done, then decode the capture:
-#    correlate timestamps in apitest output with packet hex in the capture
-```
-
-Flags:
-```
-python3 apitest.py --port 49924   # explicit port
-python3 apitest.py "http://..."   # port+token from QR URL
-python3 apitest.py --no-wait      # skip the Enter prompt (non-interactive)
-python3 apitest.py --debug        # hex-dump every WebSocket frame
-```
-
-### Updating paramType mappings
-
-If a firmware update changes the protocol:
-
-1. Run `apitest.py` with a tshark capture as above.
-2. Decode the capture hex and correlate timestamps with the action log.
-3. Update `ParamTypeV2` in `link_ctl.py` with any changed values.
-4. Update the `build_on` / `build_restore` lambdas in `validate.py`'s `make_tests()`.
-5. Run `validate.py` to confirm all commands work end-to-end.
-
----
-
-## Reverse Engineering the API
-
-This section documents how the WebSocket protocol was discovered and how to
-extend it if Insta360 changes things in a future firmware release.
-
-### How the protocol was discovered
-
-The Insta360 Link Controller app exposes a local WebSocket server so its
-**mobile web remote** (accessed by scanning a QR code in the app) can control
-the camera from a phone. All traffic between the phone and the desktop app
-travels over `lo0` (loopback), which makes it trivially capturable without any
-HTTPS interception.
-
-The protocol uses **binary Protocol Buffers** — there is no JSON or human-readable
-framing. The `.proto` schema (`insta360linkcontroller.proto` in this repo)
-provides field names and enum values, but the wire numbers are what matter for
-encoding commands.
-
-### Tools required
-
-| Tool | Purpose |
-|------|---------|
-| `tshark` | CLI packet capture, ships with Wireshark |
-| `mobileui-dump.py` | Playwright script that drives the mobile web UI while tshark captures; discovers unknown paramTypes |
-| `apitest.py` | Directly sends every known command over WebSocket with timestamps |
-| Python protobuf decoder | Inline snippet (see below) to parse raw hex from captures |
-
-Install tshark:
-```bash
-brew install wireshark   # macOS — tshark is included
-sudo apt install tshark  # Linux
-```
-
-Install Playwright (for mobileui-dump.py):
-```bash
-pip install playwright pillow
-playwright install chromium
-```
-
-### Step 1 — Find the WebSocket port and token
-
-With the Link Controller running and camera connected, the port is on loopback:
-
-```bash
-# Find the PID then the listening port
-pgrep -f "Insta360 Link Controller"   # → e.g. 1234
-lsof -i -a -n -P -p 1234 | grep LISTEN
-```
-
-The authentication token is in:
-```
-~/Library/Application Support/Insta360 Link Controller/startup.ini   # macOS
-%LOCALAPPDATA%\Insta360 Link Controller\startup.ini                   # Windows
-```
-
-Look for the `[Token]` section — each key is a token string, its value is a
-Unix timestamp. The key with the highest timestamp is the current token.
-
-### Step 2 — Get the mobile web URL from the QR code
-
-The mobile web remote URL is shown as a QR code in the app's "Remote Control"
-screen. To decode it without a phone:
-
-```bash
-# 1. Take a screenshot of the QR code (macOS)
-#    Cmd+Shift+4, drag over the QR code — saved to Desktop
-
-# 2. Decode the QR code from the screenshot
-brew install zbar   # one-time install
-zbarimg --raw -q ~/Desktop/qr_code_screenshot.png
-# Prints: http://link-controller.insta360.com/v3/link/?port=49924&token=ABC123...
-```
-
-The URL contains the `port` and `token` parameters needed by `validate.py`,
-`apitest.py`, and `mobileui-dump.py`.
-
-### Step 3 — Capture the mobile web UI
-
-Start a tshark capture (see Step 1 above for install), then drive the UI:
-
-```bash
-# Terminal 1: start capture on loopback
-sudo tshark -i lo0 -Y "websocket" -T fields \
-    -e frame.time_relative -e data.data \
-    -E header=y > ~/mobileui-capture.txt
-
-# Terminal 2: drive every button and slider in the mobile UI
-python3 mobileui-dump.py "http://link-controller.insta360.com/v3/link/?port=PORT&token=TOKEN"
-# Press Enter when tshark is running, then wait for the script to finish.
-```
-
-`mobileui-dump.py` clicks every visible button, sweeps every slider, and prints
-a timestamped action log. Correlate the timestamps with packet hex in the capture
-to map UI actions to wire bytes.
-
-### Step 4 — Send known commands directly and capture responses
-
-Once you have a working connection, use `apitest.py` to send every command in
-isolation and watch what the server sends back:
-
-```bash
-# Terminal 1
-sudo tshark -i lo0 -Y "websocket" -T fields \
-    -e frame.time_relative -e data.data \
-    -E header=y > ~/apitest-capture.txt
-
-# Terminal 2
-python3 apitest.py --port PORT
-```
-
-`apitest.py` also probes unknown paramTypes (8–30) with values `"1"` and `"0"`,
-which is how the brightness/contrast/saturation/sharpness/HDR/AWB/autofocus
-paramTypes were confirmed.
-
-### Step 5 — Decode the raw protobuf hex
-
-tshark outputs hex-encoded frame data (WebSocket payload). Decode it with this
-Python snippet:
-
-```python
-import binascii
-
-def read_varint(data, pos):
-    result, shift = 0, 0
-    while pos < len(data):
-        b = data[pos]; pos += 1
-        result |= (b & 0x7F) << shift
-        shift += 7
-        if not (b & 0x80): break
-    return result, pos
-
-def decode_fields(data):
-    pos, fields = 0, {}
-    while pos < len(data):
-        tag, pos = read_varint(data, pos)
-        field_num, wire = tag >> 3, tag & 7
-        if wire == 0:
-            val, pos = read_varint(data, pos); fields.setdefault(field_num, []).append(val)
-        elif wire == 2:
-            l, pos = read_varint(data, pos); fields.setdefault(field_num, []).append(data[pos:pos+l]); pos += l
-        elif wire == 1: pos += 8
-        elif wire == 5: pos += 4
-        else: break
-    return fields
-
-# Example: decode a raw hex string from the tshark capture
-raw = binascii.unhexlify("3a06...your hex here...")
-print(decode_fields(raw))
-```
-
-### Step 6 — Map wire bytes to features
-
-Each outgoing command from the client looks like:
-
-```
-field 7  = true (bool, varint 1)   ← "hasValueChangeNotify"
-field 16 = <bytes>                  ← ValueChangeNotification message
-  field 1 = <serial number string>
-  field 2 = <paramType int>
-  field 3 = <newValue string>       ← optional; absent for reset (paramType 3)
-  field 4 = <sub-message>           ← joystick only (float32 pan, float32 tilt)
-```
-
-Server responses include `deviceInfoNotify` (field 10) after most commands,
-which contains the updated camera state — this is how `validate.py` verifies
-that a command actually changed something.
-
-### Outer message envelope (v2.2.1)
-
-```
-field 4  bool + field 13 msg  → ControlRequest   (auth handshake)
-field 5  bool + field 14 msg  → HeartbeatRequest
-field 6  bool + field 15 msg  → PresetUpdateRequest   (preset recall/save)
-field 7  bool + field 16 msg  → ValueChangeNotification (all camera commands)
-```
-
-### DeviceInfo response structure (v2.2.1)
-
-After handshake and after most commands, the server sends `deviceInfoNotify`
-(outer field 10). Its inner layout:
-
-```
-field 1  → DeviceInfo message (repeated)
-field 2  → curDeviceSerialNum string
-
-DeviceInfo:
-  field 1  → deviceName string
-  field 2  → serialNum string
-  field 4  → mode int  (0=normal, 1=tracking, 4=overhead, 5=deskview, 6=whiteboard)
-  field 5  → ZoomInfo message { field1=curValue, field2=minValue, field3=maxValue }
-             ⚠️  mirror is also read from field 5 as a varint fallback, but is
-             unreliable — DeviceInfo does not update after a flip command.
-  field 9  → curPresetPos int
-  field 10 → image settings sub-message:
-               field 9  = HDR bool
-               field 12 = brightness int
-               field 13 = contrast int
-               field 14 = saturation int
-               field 15 = sharpness int
-               field 17 = autoExposure bool
-               field 20 = exposureComp int (0–100; 50 = 0 EV)
-               field 21 = autoWhiteBalance bool
-               field 22 = wbTemp int (Kelvin)
-               field 24 = smartComposition bool
-```
-
-### Known cascade effects
-
-Some paramTypes trigger cascades on the server side:
-
-| Command | Cascades to |
-|---------|-------------|
-| paramType=20 (AWB off) | Sets WB temperature to ~4200 K (DeviceInfo field 22) |
-| paramType=28/29/30 | Triggers a full device state dump from the server |
-
-### Tips for future firmware updates
-
-- **Start with `validate.py`** — if tests still pass, nothing changed.
-- **Check the `.proto` file** — Insta360 occasionally ships an updated
-  `insta360linkcontroller.proto` in the app bundle. Diffing it against the
-  previous version quickly shows new or renumbered paramTypes.
-  On macOS: `find /Applications/Insta360\ Link\ Controller.app -name "*.proto"`
-- **Re-run `apitest.py`** — it probes paramTypes 8–30 automatically. Watch the
-  tshark capture for server responses (state changes) to identify new mappings.
-- **Check `deviceInfoNotify` field numbers** — if image settings stop parsing,
-  the sub-message field numbers may have shifted. Use the decoder snippet above
-  on a raw capture frame to inspect the actual field layout.
-
----
-
 ## Development
 
-### Version bumping
-
-When `link_ctl.py` is staged, two hooks fire automatically:
-
-1. **`pre-commit`** — bumps the patch version in `pyproject.toml` and stages it
-2. **`prepare-commit-msg`** — prepends `v{version} — ` to your commit message
-
-So you just write the description:
-```bash
-git commit -m "add brightness command"
-# → commit message becomes: "v1.0.5 — add brightness command"
-```
-
-Doc-only commits (README, API.md, workflows, etc.) leave the version unchanged.
-
-Activate once after cloning:
-```bash
-git config core.hooksPath .githooks
-```
-
-### CI
-
-Two GitHub Actions workflows run on every push:
-
-- **`ci.yml`** — syntax check, import check, and `--help` smoke test for all
-  subcommands (Ubuntu); Homebrew formula install + test (macOS).
-- **`release.yml`** — triggered by a version tag (`v*`): publishes to PyPI via
-  OIDC trusted publishing, then auto-updates `Formula/link-ctl.rb` with the new
-  sdist URL and SHA256 from the PyPI JSON API.
-
-### Releasing
-
-```bash
-# Tag the current commit — CI does the rest
-git tag v1.0.3
-git push origin v1.0.3
-```
-
-### Scripts
-
-| Script | Purpose |
-|--------|---------|
-| `scripts/bump_version.py` | Bumps patch version in `pyproject.toml`; called by pre-commit hook |
-| `scripts/update_formula.py` | Updates `Formula/link-ctl.rb` from PyPI JSON API; called by release workflow |
+See [DEVELOPMENT.md](DEVELOPMENT.md) for reverse-engineering details, protocol internals,
+USB direct control documentation, and development tools.
