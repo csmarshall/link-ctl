@@ -19,7 +19,7 @@ jobs:
         run: pip install .
 
       - name: Syntax check
-        run: python -m py_compile link_ctl.py tools/validate.py link_usb.py scripts/bump_version.py scripts/update_formula.py
+        run: python -m py_compile link_ctl.py tools/validate.py link_usb.py link_usb_macos.py scripts/bump_version.py scripts/update_formula.py
 
       - name: Import check
         run: python -c "import link_ctl"
@@ -28,22 +28,40 @@ jobs:
         run: link-ctl --help
 
       - name: Subcommand help
+        # Derive subcommand list from `--help` output so the test can't drift
+        # from the live parser (pre-v2 this list was hard-coded and still
+        # mentioned `privacy` after we removed it).
         run: |
-          for cmd in zoom zoom-rel pan-rel tilt-rel center track deskview whiteboard overhead normal \
-                     hdr autofocus autoexposure awb mirror brightness contrast saturation sharpness \
-                     exposurecomp wb-temp gesture-zoom anti-flicker smartcomposition smartcomp-frame \
-                     preset preset-save preset-delete privacy status discover preflight; do
+          link-ctl --help | python3 -c "
+          import re, sys
+          m = re.search(r'{([\w,\-]+)}', sys.stdin.read())
+          print('\n'.join(m.group(1).split(',')))
+          " > /tmp/cmds.txt
+          cat /tmp/cmds.txt
+          while read -r cmd; do
             link-ctl "$cmd" --help > /dev/null
-          done
+          done < /tmp/cmds.txt
 
   # ── Homebrew formula install (macOS) ────────────────────────────────────────
   brew:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Clone into Homebrew's taps dir so the formula is inside a proper
+          # tap. Modern Homebrew (4.x+) refuses `brew install <file>` outside
+          # a tap with "Homebrew requires formulae to be in a tap".
+          path: homebrew-link-ctl
+
+      - name: Register as local tap
+        run: |
+          mkdir -p "$(brew --repository)/Library/Taps/csmarshall"
+          ln -s "$GITHUB_WORKSPACE/homebrew-link-ctl" \
+                "$(brew --repository)/Library/Taps/csmarshall/homebrew-link-ctl"
+          brew tap-info csmarshall/link-ctl
 
       - name: Install formula from source
-        run: brew install --build-from-source ./Formula/link-ctl.rb
+        run: brew install --build-from-source csmarshall/link-ctl/link-ctl
 
       - name: Run formula test
-        run: brew test ./Formula/link-ctl.rb
+        run: brew test csmarshall/link-ctl/link-ctl

@@ -1,0 +1,7 @@
+# CODEOWNERS — GitHub auto-requests review from owners listed here on every
+# PR that touches matching paths. `*` makes @csmarshall the default reviewer
+# for every PR in this repo.
+#
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-security/customizing-your-repository/about-code-owners
+
+* @csmarshall
