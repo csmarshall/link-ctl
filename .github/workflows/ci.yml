@@ -18,6 +18,20 @@ jobs:
       - name: Install
         run: pip install .
 
+      - name: sdist includes backend modules
+        # Guards against pyproject.toml's py-modules list drifting from what
+        # link_ctl.py actually imports — v2.0/v2.1 shipped with a missing
+        # link_usb_macos.py in the PyPI wheel, silently breaking USB-direct.
+        run: |
+          pip install build
+          python -m build --sdist --outdir /tmp/sdist
+          TAR=$(ls /tmp/sdist/*.tar.gz | head -1)
+          echo "sdist contents:"
+          tar tzf "$TAR"
+          for f in link_ctl.py link_usb_macos.py; do
+            tar tzf "$TAR" | grep -q "/$f$" || { echo "::error::$f missing from sdist"; exit 1; }
+          done
+
       - name: Syntax check
         run: python -m py_compile link_ctl.py tools/validate.py link_usb.py link_usb_macos.py scripts/bump_version.py scripts/update_formula.py
 

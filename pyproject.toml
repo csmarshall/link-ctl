@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "link-ctl"
-version = "2.1.1"
+version = "2.1.2"
 description = "CLI + pure-Python library for the Insta360 Link webcam — USB-direct on macOS via ctypes-to-IOKit, WebSocket fallback on Windows, v4l2 on Linux"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -30,4 +30,9 @@ classifiers = [
 link-ctl = "link_ctl:main"
 
 [tool.setuptools]
-py-modules = ["link_ctl"]
+# link_ctl imports link_usb_macos lazily on macOS for the pure-Python
+# USB-direct path (ctypes → IOKit). Without it the package silently falls
+# back to the WebSocket route at runtime, defeating the whole point of
+# v2.x on macOS. Keep them both listed here so pip installs get a
+# working USB-direct stack out of the box.
+py-modules = ["link_ctl", "link_usb_macos"]
