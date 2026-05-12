@@ -3,8 +3,8 @@ class LinkCtl < Formula
 
   desc "CLI and Python library for the Insta360 Link webcam (USB-direct on macOS)"
   homepage "https://github.com/csmarshall/link-ctl"
-  url "https://files.pythonhosted.org/packages/b4/9f/14017dac0599e9ca33777151acf02902a7c447fdb7ccf19f2b1e28969da1/link_ctl-2.1.2.tar.gz"
-  sha256 "d8f87bfd8ba2490eb10f8ef0868d294c86be7f9499aa341bec728f08534fac16"
+  url "https://files.pythonhosted.org/packages/5b/62/6c217363f6856eb3be6977f6d0c510994174fa32fdcb0d4f1ddc1e4163b1/link_ctl-2.1.3.tar.gz"
+  sha256 "8a81de8a634ee9d8837a521ba7ef1a8c3912e901d42bd7ef5376835f033b7001"
   license "MIT"
 
   depends_on "python@3.11"
