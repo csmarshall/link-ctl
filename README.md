@@ -153,6 +153,10 @@ Legend: ✅ confirmed + validated · ⚠️ confirmed sent, limited/no readback 
 | Anti-Flicker | `anti-flicker auto\|50hz\|60hz` | 27 | — | ✅ All three values confirmed |
 | Horizontal Flip | `mirror on\|off\|toggle` | 2 | — | ⚠️ DeviceInfo mirror field does not update; toggle defaults to on |
 | Smart Composition | `smartcomposition on\|off\|toggle` | 11 | — | ✅ Confirmed from capture; requires AI tracking on |
+| AI Tracking Speed | `track-speed <0-255>` | 20 (best-guess) | — | ⚠️ USB-direct R/W verified; OG Link behavioral semantics TBD |
+| Noise Cancel | `noise-cancel on\|off\|toggle` | — (no proto entry) | — | ✅ USB-direct R/W verified; macOS only |
+| Manual ISO | `iso <0-65535>` | 23 (best-guess) | — | ✅ USB-direct R/W verified; requires AE off |
+| Manual Shutter | `shutter <0-65535>` | 24 (best-guess) | — | ✅ USB-direct R/W verified; requires AE off; units µs |
 | Smart Comp Frame | `smartcomp-frame head\|halfbody\|wholebody` | 10 | — | ✅ Confirmed from capture |
 | Gesture Zoom | `gesture-zoom on\|off\|toggle` | 39 | — | ⚠️ No DeviceInfo readback |
 
@@ -290,7 +294,14 @@ link-ctl deskview [on|off|toggle|status]   # DeskView (desk surface view)
 link-ctl whiteboard [on|off|toggle|status] # Whiteboard mode
 link-ctl overhead [on|off|toggle|status]   # Overhead / top-down
 link-ctl normal                            # Return to standard mode (clears all AI modes)
+link-ctl track-speed <0-255>               # AI tracking speed (default 2; OG Link semantics TBD)
 ```
+
+The `track-speed` control persists any byte the firmware is given. The
+default value on a fresh device is `2`. The mobile remote UI does not
+expose this control, so the effective behavioral range on the OG Link is
+not characterized — small values near the default are recommended until
+someone runs a controlled subject-tracking comparison.
 
 ### Image Settings
 
@@ -317,10 +328,31 @@ link-ctl exposurecomp <0-100>                     # Exposure compensation (50 = 
 link-ctl wb-temp <2800-10000>                     # WB temperature in Kelvin (AWB must be off)
 link-ctl mirror [on|off|toggle|status]            # Horizontal flip
 link-ctl gesture-zoom [on|off|toggle|status]      # Gesture control zoom
+link-ctl noise-cancel [on|off|toggle|status]      # Microphone noise cancellation (USB-direct only)
+link-ctl iso <0-65535>                            # Manual ISO (autoexposure must be off)
+link-ctl shutter <0-65535>                        # Manual shutter speed in µs (autoexposure must be off)
 ```
 
 Scalar settings (brightness/contrast/etc.) are read via the top-level
 `link-ctl status <option>` form — see Diagnostics below.
+
+#### Manual exposure (iso / shutter)
+
+`iso` and `shutter` are *AE-gated*: the firmware silently overrides any
+write while autoexposure is on. The setter prints a warning if AE is on
+and goes ahead anyway (so scripts can still automate the gating
+themselves). Typical workflow:
+
+```bash
+link-ctl autoexposure off
+link-ctl iso 200
+link-ctl shutter 500   # microseconds; 1000 = 1 ms = 1/1000 s
+link-ctl status iso
+link-ctl status shutter
+```
+
+Read access is **not** gated — `link-ctl status iso` works regardless of
+AE state and returns whatever the firmware currently reports.
 
 ### Presets
 

@@ -52,9 +52,16 @@ class TestStatusOptionsTable(unittest.TestCase):
         # If any of these stops being a bool the README + exit-code contract
         # silently breaks.
         for opt in ('hdr', 'mirror', 'awb', 'autoexposure', 'autofocus',
-                    'gesture-zoom', 'smartcomposition'):
+                    'gesture-zoom', 'smartcomposition', 'noise-cancel'):
             self.assertEqual(link_ctl.STATUS_OPTIONS[opt]['kind'], 'bool',
                              f"{opt} kind changed unexpectedly")
+
+    def test_unmapped_v2_xu_controls_present(self):
+        # Lock in the four selectors that came out of the
+        # probe_unmapped_xu.py round so a regression can't quietly delete
+        # them from the table.
+        for opt in ('track-speed', 'noise-cancel', 'iso', 'shutter'):
+            self.assertIn(opt, link_ctl.STATUS_OPTIONS, f"{opt} missing from table")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -114,6 +121,37 @@ class TestParser(unittest.TestCase):
     def test_top_level_status_invalid_option(self):
         with self.assertRaises(SystemExit):
             self._parse('status', 'definitely-not-an-option')
+
+    def test_track_speed_setter_parses(self):
+        args = self._parse('track-speed', '5')
+        self.assertEqual(args.command, 'track-speed')
+        self.assertEqual(args.value, 5)
+
+    def test_track_speed_status_reads(self):
+        # Per-option form via top-level status; track-speed has no per-cmd
+        # `status` arg because it's a scalar (takes a value positional).
+        args = self._parse('status', 'track-speed')
+        self.assertEqual(args.option, 'track-speed')
+
+    def test_noise_cancel_per_option_status(self):
+        for state in ('on', 'off', 'toggle', 'status'):
+            with self.subTest(state=state):
+                args = self._parse('noise-cancel', state)
+                self.assertEqual(args.state, state)
+
+    def test_noise_cancel_bare_toggles(self):
+        # Same no-arg-toggle preservation as the other bool commands.
+        args = self._parse('noise-cancel')
+        self.assertIsNone(args.state)
+
+    def test_iso_shutter_take_value(self):
+        for cmd in ('iso', 'shutter'):
+            with self.subTest(cmd=cmd):
+                args = self._parse(cmd, '400')
+                self.assertEqual(args.value, 400)
+                # And the top-level status form must accept them too.
+                args = self._parse('status', cmd)
+                self.assertEqual(args.option, cmd)
 
     def test_top_level_status_choices_match_table(self):
         # The parser's choices list must be the set of STATUS_OPTIONS keys —
@@ -209,6 +247,53 @@ class TestReadStatusUsb(unittest.TestCase):
         self.assertEqual(r['display'], '42')
         self.assertIsNone(r['is_on'])
 
+    def test_track_speed_reads_from_correct_selector(self):
+        # Belt-and-suspenders: a regression that pointed track-speed at
+        # the wrong selector would happily decode a different control's
+        # value (and silently break tracking). Lock the read path.
+        called = {}
+        def fake_get(unit, sel, length):
+            called['unit'], called['sel'], called['length'] = unit, sel, length
+            return bytes([7])
+        with mock.patch.object(link_ctl, '_uvc_get', side_effect=fake_get):
+            r = link_ctl.read_status_usb('track-speed')
+        self.assertEqual(called, {'unit': 9, 'sel': link_ctl.TRACK_SPEED_SEL,
+                                  'length': 1})
+        self.assertEqual(r['value'], 7)
+        self.assertEqual(r['display'], '7')
+        self.assertIsNone(r['is_on'])
+
+    def test_noise_cancel_reads_correct_selector(self):
+        called = {}
+        def fake_get(unit, sel, length):
+            called['unit'], called['sel'] = unit, sel
+            return bytes([1])
+        with mock.patch.object(link_ctl, '_uvc_get', side_effect=fake_get):
+            r = link_ctl.read_status_usb('noise-cancel')
+        self.assertEqual(called, {'unit': 9, 'sel': link_ctl.NOISE_CANCEL_SEL})
+        self.assertTrue(r['is_on'])
+
+    def test_iso_decodes_le_uint16(self):
+        called = {}
+        def fake_get(unit, sel, length):
+            called['unit'], called['sel'], called['length'] = unit, sel, length
+            return b'\xc8\x00'  # 200 LE
+        with mock.patch.object(link_ctl, '_uvc_get', side_effect=fake_get):
+            r = link_ctl.read_status_usb('iso')
+        self.assertEqual(called, {'unit': 9, 'sel': link_ctl.ISO_SEL, 'length': 2})
+        self.assertEqual(r['value'], 200)
+        self.assertEqual(r['display'], '200')
+
+    def test_shutter_decodes_le_uint16(self):
+        called = {}
+        def fake_get(unit, sel, length):
+            called['unit'], called['sel'], called['length'] = unit, sel, length
+            return b'\xe8\x03'  # 1000 LE
+        with mock.patch.object(link_ctl, '_uvc_get', side_effect=fake_get):
+            r = link_ctl.read_status_usb('shutter')
+        self.assertEqual(called, {'unit': 9, 'sel': link_ctl.SHUTTER_SEL, 'length': 2})
+        self.assertEqual(r['value'], 1000)
+
     def test_zoom_uses_read_zoom_helper(self):
         with mock.patch.object(link_ctl, 'read_zoom', return_value=275):
             r = link_ctl.read_status_usb('zoom')
@@ -274,6 +359,25 @@ class TestReadStatusWs(unittest.TestCase):
         self.assertEqual(link_ctl.read_status_ws('brightness', self.SAMPLE_DEV)['value'], 55)
         self.assertEqual(link_ctl.read_status_ws('zoom', self.SAMPLE_DEV)['value'], 200)
         self.assertEqual(link_ctl.read_status_ws('wb-temp', self.SAMPLE_DEV)['value'], 5500)
+
+    def test_track_speed_via_ws(self):
+        dev = {**self.SAMPLE_DEV, 'trackSpeed': 4}
+        self.assertEqual(link_ctl.read_status_ws('track-speed', dev)['value'], 4)
+
+    def test_iso_via_ws(self):
+        dev = {**self.SAMPLE_DEV, 'isoValue': 400}
+        self.assertEqual(link_ctl.read_status_ws('iso', dev)['value'], 400)
+
+    def test_shutter_via_ws(self):
+        dev = {**self.SAMPLE_DEV, 'shutterValue': 2000}
+        self.assertEqual(link_ctl.read_status_ws('shutter', dev)['value'], 2000)
+
+    def test_noise_cancel_not_in_ws(self):
+        # No DeviceInfoNotify field for noise-cancel; the table flags it
+        # ws=False so a regression would surface as an unexpected ws=True.
+        self.assertFalse(link_ctl.STATUS_OPTIONS['noise-cancel']['ws'])
+        with self.assertRaises(KeyError):
+            link_ctl.read_status_ws('noise-cancel', self.SAMPLE_DEV)
 
     def test_options_not_in_ws(self):
         # gesture-zoom, autofocus, anti-flicker, smartcomp-frame are set-only

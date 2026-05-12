@@ -132,6 +132,15 @@ class ParamTypeV2:
     AUTOFOCUS         = 18  # Auto focus; "1"/"0" (confirmed from tshark capture 2026-03-10)
     SMART_COMPOSITION = 11  # Smart composition on/off; "1"/"0" (confirmed from tshark 2026-03-10)
     SMART_COMP_FRAME  = 10  # Smart composition framing; "1"=Head, "2"=HalfBody, "3"=WholeBody (confirmed)
+    # ── Proto-declared but never empirically wire-confirmed in v2.2.1 ─────────
+    # The proto numbers were renumbered for several controls in v2.2.1
+    # (e.g. HDR went 19→26). The values below are best-guess placeholders
+    # from the proto. USB-direct is the authoritative path on macOS; on
+    # Linux/Windows these WS sends will silently no-op if the firmware
+    # has renumbered them. Will be corrected after a tshark capture.
+    TRACK_SPEED       = 20
+    ISO_VALUE         = 23
+    SHUTTER_VALUE     = 24
 
 class AIMode:
     """Command values for ParamTypeV2.AI_MODE (paramType=5). Confirmed from captures."""
@@ -292,11 +301,14 @@ def parse_response(data: bytes) -> dict:
                 s = _decode_fields(img_bytes)
                 img = {
                     'hdr':                bool(_int_from(s,  9)),
+                    'trackSpeed':         _int_from(s, 10),
                     'brightness':         _int_from(s, 12),
                     'contrast':           _int_from(s, 13),
                     'saturation':         _int_from(s, 14),
                     'sharpness':          _int_from(s, 15),
                     'autoExposure':       bool(_int_from(s, 17)),
+                    'isoValue':           _int_from(s, 18),
+                    'shutterValue':       _int_from(s, 19),
                     'exposureComp':       _int_from(s, 20),
                     'autoWhiteBalance':   bool(_int_from(s, 21)),
                     'wbTemp':             _int_from(s, 22),
@@ -593,6 +605,27 @@ def read_ai_mode() -> str:
 FRAMING_SEL = 0x13
 FRAMING_BYTES = {'head': 1, 'halfbody': 2, 'wholebody': 3}
 
+# Track speed at unit 9 sel 0x12, 1 byte. Empirical: firmware accepts the
+# full 0..255 range and persists every value, default is 2. Effective
+# semantics on OG Link are unconfirmed — the proto name suggests a
+# tracking-smoothness parameter and the small default hints at a natural
+# range around 0..10. No UI in the mobile remote exposes this control.
+TRACK_SPEED_SEL = 0x12
+
+# Microphone noise cancellation at unit 9 sel 0x07, 1 byte. 1=on, 0=off.
+# Confirmed R/W via probe_unmapped_xu.py on 2026-05-12. No proto ParamType
+# — USB-direct path only; falls through to a warning on Linux/Windows.
+NOISE_CANCEL_SEL = 0x07
+
+# Manual ISO at unit 9 sel 0x19, 2-byte LE uint16. Manual shutter speed
+# at unit 9 sel 0x1D, 2-byte LE uint16 (units appear to be µs — 1000=1ms).
+# Both R/W-verified 2026-05-12 BUT firmware silently overrides any write
+# while autoexposure is on. Set `autoexposure off` first or the value
+# will snap back. We don't actively gate at the CLI layer — same pattern
+# as wb-temp / AWB.
+ISO_SEL     = 0x19
+SHUTTER_SEL = 0x1D
+
 # Exposure-compensation scale: XU stores as int16 LE where 100 = 1 EV.
 # Desktop app exposes 0..100 where 50 = 0 EV; here we keep the same API
 # surface for consistency. Internal value = (user_value - 50) * 6 (gives
@@ -633,8 +666,12 @@ STATUS_OPTIONS: dict[str, dict] = {
     'awb':              {'kind': 'bool',    'usb': True,  'ws': True,  'linux': True},
     'autofocus':        {'kind': 'bool',    'usb': True,  'ws': False, 'linux': True},
     'smartcomposition': {'kind': 'bool',    'usb': False, 'ws': True,  'linux': False},
+    'noise-cancel':     {'kind': 'bool',    'usb': True,  'ws': False, 'linux': False},
     'smartcomp-frame':  {'kind': 'enum',    'usb': True,  'ws': False, 'linux': False},
     'anti-flicker':     {'kind': 'enum',    'usb': True,  'ws': False, 'linux': True},
+    'track-speed':      {'kind': 'scalar',  'usb': True,  'ws': True,  'linux': False},
+    'iso':              {'kind': 'scalar',  'usb': True,  'ws': True,  'linux': False},
+    'shutter':          {'kind': 'scalar',  'usb': True,  'ws': True,  'linux': False},
     'brightness':       {'kind': 'scalar',  'usb': True,  'ws': True,  'linux': True},
     'contrast':         {'kind': 'scalar',  'usb': True,  'ws': True,  'linux': True},
     'saturation':       {'kind': 'scalar',  'usb': True,  'ws': True,  'linux': True},
@@ -685,6 +722,8 @@ def read_status_usb(option: str) -> dict:
         v = _uvc_get(5, 0x0B, 1) == bytes([1]); return _status_result(option, v, is_on=v)
     if option == 'autofocus':
         v = _uvc_get(1, 0x08, 1) == bytes([1]); return _status_result(option, v, is_on=v)
+    if option == 'noise-cancel':
+        v = _uvc_get(9, NOISE_CANCEL_SEL, 1) == bytes([1]); return _status_result(option, v, is_on=v)
 
     if option == 'anti-flicker':
         raw = _uvc_get(5, 0x05, 1)[0]
@@ -695,6 +734,9 @@ def read_status_usb(option: str) -> dict:
         name = {1: 'head', 2: 'halfbody', 3: 'wholebody'}.get(raw, f'unknown({raw})')
         return _status_result(option, name, display=name)
 
+    if option == 'track-speed':  return _status_result(option, _uvc_get(9, TRACK_SPEED_SEL, 1)[0])
+    if option == 'iso':          return _status_result(option, struct.unpack('<H', _uvc_get(9, ISO_SEL, 2))[0])
+    if option == 'shutter':      return _status_result(option, struct.unpack('<H', _uvc_get(9, SHUTTER_SEL, 2))[0])
     if option == 'brightness':   return _status_result(option, _uvc_get(5, 0x02, 1)[0])
     if option == 'contrast':     return _status_result(option, _uvc_get(5, 0x03, 1)[0])
     if option == 'saturation':   return _status_result(option, struct.unpack('<H', _uvc_get(5, 0x07, 2))[0])
@@ -737,7 +779,9 @@ def read_status_ws(option: str, dev: dict) -> dict:
 
     scalar_map = {'brightness': 'brightness', 'contrast': 'contrast',
                   'saturation': 'saturation', 'sharpness': 'sharpness',
-                  'exposurecomp': 'exposureComp', 'wb-temp': 'wbTemp'}
+                  'exposurecomp': 'exposureComp', 'wb-temp': 'wbTemp',
+                  'track-speed': 'trackSpeed',
+                  'iso': 'isoValue', 'shutter': 'shutterValue'}
     if option in scalar_map:
         return _status_result(option, dev.get(scalar_map[option]))
     if option == 'zoom':
@@ -906,6 +950,42 @@ def usb_image_dispatch(args) -> None:
             new_mode = target_mode if state == 'on' else 'normal'
             write_ai_mode(new_mode)
             _info(f"{cmd}: {cur} → {new_mode}")
+
+        # ── Track speed (firmware accepts 0..255; semantics unconfirmed) ─────
+        elif cmd == 'track-speed':
+            v = args.value
+            if not (0 <= v <= 255): raise ValueError('track-speed 0..255')
+            _uvc_set(9, TRACK_SPEED_SEL, bytes([v]))
+            _info(f'track-speed → {v}')
+
+        # ── Microphone noise cancellation (u9 sel 0x07, 1B bool) ─────────────
+        elif cmd == 'noise-cancel':
+            target = args.state
+            cur = _uvc_get(9, NOISE_CANCEL_SEL, 1) == bytes([1])
+            if target in (None, 'toggle'):
+                target = 'off' if cur else 'on'
+            _uvc_set(9, NOISE_CANCEL_SEL, bytes([1 if target == 'on' else 0]))
+            _info(f"noise-cancel: {'on' if cur else 'off'} → {target}")
+
+        # ── Manual ISO (u9 sel 0x19, 2B LE uint16; AE-off gated) ─────────────
+        elif cmd == 'iso':
+            v = args.value
+            if not (0 <= v <= 65535): raise ValueError('iso 0..65535')
+            ae = _uvc_get(9, 0x1e, 1) == bytes([2])
+            if ae:
+                _warn('⚠ autoexposure is on; firmware will silently override the ISO write')
+            _uvc_set(9, ISO_SEL, struct.pack('<H', v))
+            _info(f'iso → {v}')
+
+        # ── Manual shutter (u9 sel 0x1D, 2B LE uint16; AE-off gated) ─────────
+        elif cmd == 'shutter':
+            v = args.value
+            if not (0 <= v <= 65535): raise ValueError('shutter 0..65535')
+            ae = _uvc_get(9, 0x1e, 1) == bytes([2])
+            if ae:
+                _warn('⚠ autoexposure is on; firmware will silently override the shutter write')
+            _uvc_set(9, SHUTTER_SEL, struct.pack('<H', v))
+            _info(f'shutter → {v}')
 
         # ── Smart composition framing ─────────────────────────────────────────
         elif cmd == 'smartcomp-frame':
@@ -1979,6 +2059,34 @@ async def dispatch(args, port: int, debug: bool):
         _info(f"anti-flicker: → {mode}")
         payloads.append(build_value_change(serial, ParamTypeV2.ANTI_FLICKER, val))
 
+    elif cmd == 'track-speed':
+        v = args.value
+        if not (0 <= v <= 255):
+            _warn("✗ track-speed must be 0..255")
+            await client.close(); sys.exit(1)
+        _info(f"track-speed: {dev.get('trackSpeed', '?')} → {v}")
+        payloads.append(build_value_change(serial, ParamTypeV2.TRACK_SPEED, str(v)))
+
+    elif cmd == 'iso':
+        v = args.value
+        if not (0 <= v <= 65535):
+            _warn("✗ iso must be 0..65535")
+            await client.close(); sys.exit(1)
+        if dev.get('autoExposure'):
+            _warn("⚠ autoexposure is on; firmware will likely override the ISO write")
+        _info(f"iso: {dev.get('isoValue', '?')} → {v}")
+        payloads.append(build_value_change(serial, ParamTypeV2.ISO_VALUE, str(v)))
+
+    elif cmd == 'shutter':
+        v = args.value
+        if not (0 <= v <= 65535):
+            _warn("✗ shutter must be 0..65535")
+            await client.close(); sys.exit(1)
+        if dev.get('autoExposure'):
+            _warn("⚠ autoexposure is on; firmware will likely override the shutter write")
+        _info(f"shutter: {dev.get('shutterValue', '?')} → {v}")
+        payloads.append(build_value_change(serial, ParamTypeV2.SHUTTER_VALUE, str(v)))
+
     for payload in payloads:
         await client.send_command(payload, wait_ms=80)
 
@@ -2263,6 +2371,8 @@ def build_parser() -> argparse.ArgumentParser:
   whiteboard   [on|off|toggle|status]   whiteboard mode
   overhead     [on|off|toggle|status]   overhead / top-down view
   normal                                return to standard mode
+  track-speed  <0-255>                  AI tracking speed (default 2; OG Link semantics TBD)
+  noise-cancel [on|off|toggle|status]   microphone noise cancellation (USB-direct only)
 
   ── Image settings  (USB-direct on macOS; WS elsewhere) ────────────
   hdr              [on|off|toggle|status]   HDR
@@ -2280,6 +2390,8 @@ def build_parser() -> argparse.ArgumentParser:
   sharpness   <0-100>    sharpness   (default 50)
   exposurecomp <0-100>   exposure compensation (50 = 0 EV)
   wb-temp  <2800-10000>  white balance temperature in Kelvin (AWB must be off)
+  iso          <0-65535> manual ISO (autoexposure must be off)
+  shutter      <0-65535> manual shutter speed in µs (autoexposure must be off)
 
   ── Presets (USB-direct on macOS; WebSocket elsewhere) ─────────────
   preset          <0-19>        recall saved preset
@@ -2369,6 +2481,10 @@ print the current value to stdout. Equivalent forms:
     s = sub.add_parser('sharpness');     s.add_argument('value', type=int)
     s = sub.add_parser('exposurecomp');  s.add_argument('value', type=int, help='Exposure compensation 0..100 (50 = 0 EV)')
     s = sub.add_parser('wb-temp');       s.add_argument('value', type=int, help='White balance temperature 2800..10000 K (AWB must be off)')
+    s = sub.add_parser('track-speed');   s.add_argument('value', type=int, help='AI tracking speed 0..255 (default 2; effective semantics on OG Link TBD)')
+    s = sub.add_parser('noise-cancel');  s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
+    s = sub.add_parser('iso');           s.add_argument('value', type=int, help='Manual ISO 0..65535 (autoexposure must be off)')
+    s = sub.add_parser('shutter');       s.add_argument('value', type=int, help='Manual shutter (autoexposure must be off; units appear to be µs — 1000 = 1 ms)')
     s = sub.add_parser('gesture-zoom');  s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
     s = sub.add_parser('anti-flicker');  s.add_argument('mode', choices=['auto', '50hz', '60hz', 'status'])
 
@@ -2468,7 +2584,8 @@ def main():
                     'wb-temp', 'exposurecomp', 'autoexposure', 'awb',
                     'anti-flicker', 'autofocus',
                     'track', 'deskview', 'whiteboard', 'overhead', 'normal',
-                    'smartcomp-frame'}
+                    'smartcomp-frame', 'track-speed',
+                    'noise-cancel', 'iso', 'shutter'}
     if cmd in USB_IMG_CMDS and _uvc_probe_available():
         usb_image_dispatch(args)
         return
