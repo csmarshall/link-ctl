@@ -411,6 +411,10 @@ Each has an empirical round-trip test in `tools/xu_verify.py`.
 | AI video mode | `track`, `whiteboard`, `overhead`, `deskview`, `normal` | XU1 (9) | 0x02 | 52 | byte[0]=mode_id, byte[1]=flag | vrwallace |
 | Exposure comp | `exposurecomp` | XU1 (9) | 0x09 | 2 | int16 LE `(val−50)×6` | verified |
 | Smartcomp framing | `smartcomp-frame` | XU1 (9) | 0x13 | 1 | 1=head, 2=half, 3=full | vrwallace |
+| Track speed | `track-speed` | XU1 (9) | 0x12 | 1 | 0..255 (default 2) | verified R/W 2026-05-12 via `tools/probe_unmapped_xu.py`; behavioral range on OG Link not yet characterized |
+| Noise cancel | `noise-cancel` | XU1 (9) | 0x07 | 1 | 1=on, 0=off (default 1) | verified R/W 2026-05-12; no DeviceInfoNotify field |
+| Manual ISO | `iso` | XU1 (9) | 0x19 | 2 | uint16 LE; AE-off gated (firmware ignores writes while AE is on) | verified R/W 2026-05-12 (with AE off) |
+| Manual shutter | `shutter` | XU1 (9) | 0x1D | 2 | uint16 LE in µs (1000 = 1 ms); AE-off gated | verified R/W 2026-05-12 (with AE off) |
 | Pan/tilt readback | (internal `read_pantilt`) | XU1 (9) | 0x1A | 8 | int32 LE **tilt** + int32 LE **pan** | verified |
 | Func-enable bitmask | `hdr`, `mirror`, `gesture-zoom` | XU1 (9) | 0x1B | 2 | uint16 LE; bit 2=HDR, bit 3=mirror, bit 4=gesture-zoom | verified |
 | AE mode | `autoexposure` | XU1 (9) | 0x1E | 1 | 2=auto, 1=manual | verified |

@@ -360,6 +360,31 @@ All values below were confirmed by automated capture (`tools/xu_capture.py` usin
 | Autofocus | CT (1) | 0x08 | 1 | 1=auto, 0=manual | |
 | Zoom | CT (1) | 0x0b | 1 | 0x64=1x (100) | Mapping not fully calibrated |
 | Pan/Tilt (read) | XU1 (9) | 0x1a | 8 | Two LE int32: pan, tilt | Read-only; SET_CUR ignored by firmware |
+| Smartcomp framing | XU1 (9) | 0x13 | 1 | 1=head, 2=halfbody, 3=wholebody | Same selector as proto's `XU_LAYOUT_STYLE_CONTROL` |
+
+### AE-gated manual exposure controls
+
+`iso` and `shutter` are silently overridden by the firmware while
+**autoexposure is on** — writes succeed at the USB layer (no error) but
+the value snaps back. With AE off the writes persist normally.
+Empirically verified 2026-05-12 via `tools/probe_unmapped_xu.py --write`.
+link-ctl prints a warning if you try to write either while AE is on; the
+write goes through anyway so scripts can manage the gating themselves.
+
+| Control | Unit | Selector | Size | Format | Notes |
+|---------|------|----------|------|--------|-------|
+| Manual ISO (`iso`) | XU1 (9) | 0x19 | 2 | LE uint16 | Requires `autoexposure off` |
+| Manual shutter (`shutter`) | XU1 (9) | 0x1d | 2 | LE uint16 (µs; 1000 = 1 ms) | Same gating |
+
+### Other v2.x-era controls (not AE-gated)
+
+Discovered via `tools/probe_unmapped_xu.py` on 2026-05-12. Not exposed by
+the Insta360 Link Controller mobile remote, but the firmware honors them.
+
+| Control | Unit | Selector | Size | Format | Notes |
+|---------|------|----------|------|--------|-------|
+| Track speed (`track-speed`) | XU1 (9) | 0x12 | 1 | int 0..255 (default 2) | Firmware accepts every byte value; behavioral semantics on OG Link not yet characterized |
+| Noise cancel (`noise-cancel`) | XU1 (9) | 0x07 | 1 | 1=on, 0=off | Mic noise cancellation; no proto `ParamType`, so USB-direct only |
 
 ### Func-enable Bitmask (unit 9, selector 0x1b)
 
@@ -373,14 +398,24 @@ Read the current value, flip the desired bit, write it back.
 | 4 | Gesture zoom | Yes |
 | 11 | "Privacy" (ExtremePrivacy) | Link 2/2 Pro only; firmware ignores on original Link |
 
-### Noise Registers (change on most operations, not controllable)
+### Readback / status registers (read-only by intent)
+
+These selectors *can* be written via SET_CUR (GET_INFO reports SET capability)
+but they hold firmware-computed status, not user-settable values — writes are
+either silently no-op or stomped by the next firmware status update.
 
 | Unit | Selector | Name | Notes |
 |------|----------|------|-------|
 | 5 | 0x0a | Sensor status | Changes with nearly every operation |
-| 9 | 0x19 | ISO/AE readback | Auto-exposure state, not writable |
 | 9 | 0x0b | Device status | 5-byte status word |
-| 9 | 0x0f | AF/exposure readback | Changes with zoom, mode, focus operations |
+| 9 | 0x0f | AF/exposure readback | 12 bytes; changes with zoom, mode, focus. Proto labels this `XU_AF_MODE_OR_DOWNLOAD_FILE` — treat as readback, not a control |
+| 9 | 0x14 | Head list | 240 bytes; populates when AI tracking is on and faces are in frame |
+| 9 | 0x15 | Track target | 8 bytes; current tracking target descriptor |
+
+> **History:** earlier revisions of this doc listed selector 0x19 here as
+> "ISO/AE readback, not writable." That was wrong — see the AE-gated manual
+> exposure section above. The original conclusion was reached by probing
+> with AE on (in which case the firmware silently overrides manual writes).
 
 ### Camera Off/On (USB Device Suspend)
 

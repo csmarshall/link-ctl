@@ -24,7 +24,7 @@ run() {
 
 echo "── Per-option status form (link-ctl <opt> status) ──"
 for opt in track deskview whiteboard overhead \
-           hdr mirror gesture-zoom autoexposure awb autofocus; do
+           hdr mirror gesture-zoom autoexposure awb autofocus noise-cancel; do
   run "$opt status" "$opt" status
 done
 run "anti-flicker status" anti-flicker status
@@ -33,9 +33,10 @@ run "smartcomp-frame status" smartcomp-frame status
 echo
 echo "── Top-level status form (link-ctl status <opt>) ──"
 for opt in track deskview whiteboard overhead mode \
-           hdr mirror gesture-zoom autoexposure awb autofocus \
+           hdr mirror gesture-zoom autoexposure awb autofocus noise-cancel \
            anti-flicker smartcomp-frame \
            brightness contrast saturation sharpness exposurecomp wb-temp \
+           track-speed iso shutter \
            zoom pan tilt; do
   run "status $opt" status "$opt"
 done
