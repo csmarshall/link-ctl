@@ -56,6 +56,13 @@ jobs:
             link-ctl "$cmd" --help > /dev/null
           done < /tmp/cmds.txt
 
+      - name: Unit tests
+        # Hardware-free tests for STATUS_OPTIONS, parser shapes, the
+        # per-backend readers (mocked I/O), and exit-code semantics. The
+        # end-to-end CLI tests skip themselves automatically without a
+        # USB-direct camera.
+        run: python -m unittest discover -v tests
+
   # ── Homebrew formula install (macOS) ────────────────────────────────────────
   brew:
     runs-on: macos-latest

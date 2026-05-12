@@ -605,7 +605,208 @@ def _ec_wire_to_user(raw: bytes) -> int:
 
 # AE mode at unit 9 sel 0x1e — 1 byte. 2=auto, 1=manual.
 # Anti-flicker at unit 5 sel 0x05 — 1 byte. 3=auto, 1=50Hz, 2=60Hz.
-AF_MAP = {'auto': 3, '50hz': 1, '60hz': 2}
+AF_MAP     = {'auto': 3, '50hz': 1, '60hz': 2}
+AF_MAP_INV = {v: k for k, v in AF_MAP.items()}
+
+
+# ── Status query metadata ───────────────────────────────────────────────────
+# Each option's "kind" drives exit-code semantics:
+#   bool    — exit 0 iff value is true. stdout "on"/"off".
+#   ai-mode — exit 0 iff current mode matches option name. stdout "on"/"off".
+#   enum    — exit 0 always. stdout = current value (e.g. "60hz", "head").
+#   scalar  — exit 0 always. stdout = number (e.g. "62", "200").
+#
+# `usb` and `ws` flags indicate whether the option is readable via that
+# backend. The Linux v4l2 path is a subset of USB controls (PU scalars +
+# PTZ + AE/AF/AWB/anti-flicker); AI modes / HDR / mirror / gesture-zoom /
+# smartcomp(-frame) are not exposed via standard v4l2 names.
+STATUS_OPTIONS: dict[str, dict] = {
+    'track':            {'kind': 'ai-mode', 'usb': True,  'ws': True,  'linux': False},
+    'deskview':         {'kind': 'ai-mode', 'usb': True,  'ws': True,  'linux': False},
+    'whiteboard':       {'kind': 'ai-mode', 'usb': True,  'ws': True,  'linux': False},
+    'overhead':         {'kind': 'ai-mode', 'usb': True,  'ws': True,  'linux': False},
+    'mode':             {'kind': 'enum',    'usb': True,  'ws': True,  'linux': False},
+    'hdr':              {'kind': 'bool',    'usb': True,  'ws': True,  'linux': False},
+    'mirror':           {'kind': 'bool',    'usb': True,  'ws': True,  'linux': False},
+    'gesture-zoom':     {'kind': 'bool',    'usb': True,  'ws': False, 'linux': False},
+    'autoexposure':     {'kind': 'bool',    'usb': True,  'ws': True,  'linux': True},
+    'awb':              {'kind': 'bool',    'usb': True,  'ws': True,  'linux': True},
+    'autofocus':        {'kind': 'bool',    'usb': True,  'ws': False, 'linux': True},
+    'smartcomposition': {'kind': 'bool',    'usb': False, 'ws': True,  'linux': False},
+    'smartcomp-frame':  {'kind': 'enum',    'usb': True,  'ws': False, 'linux': False},
+    'anti-flicker':     {'kind': 'enum',    'usb': True,  'ws': False, 'linux': True},
+    'brightness':       {'kind': 'scalar',  'usb': True,  'ws': True,  'linux': True},
+    'contrast':         {'kind': 'scalar',  'usb': True,  'ws': True,  'linux': True},
+    'saturation':       {'kind': 'scalar',  'usb': True,  'ws': True,  'linux': True},
+    'sharpness':        {'kind': 'scalar',  'usb': True,  'ws': True,  'linux': True},
+    'exposurecomp':     {'kind': 'scalar',  'usb': True,  'ws': True,  'linux': False},
+    'wb-temp':          {'kind': 'scalar',  'usb': True,  'ws': True,  'linux': True},
+    'zoom':             {'kind': 'scalar',  'usb': True,  'ws': True,  'linux': True},
+    'pan':              {'kind': 'scalar',  'usb': True,  'ws': False, 'linux': True},
+    'tilt':             {'kind': 'scalar',  'usb': True,  'ws': False, 'linux': True},
+}
+
+# Bool/enum/ai-mode options have an "is-active" notion (exit 0 iff true).
+# Scalars / mode-enum just print their value with exit 0.
+def _status_result(option: str, value, *, is_on: bool | None = None,
+                   display: str | None = None) -> dict:
+    if display is None:
+        if isinstance(value, bool): display = 'on' if value else 'off'
+        elif value is None:         display = 'unknown'
+        else:                       display = str(value)
+    return {'option': option, 'value': value, 'display': display, 'is_on': is_on}
+
+
+def read_status_usb(option: str) -> dict:
+    """Read one option's state via the USB-direct backend (macOS uvc-probe /
+    ctypes IOKit). Raises on read failure."""
+    meta = STATUS_OPTIONS.get(option)
+    if not meta or not meta['usb']:
+        raise KeyError(f"option {option!r} not readable via USB")
+
+    if option in ('track', 'deskview', 'whiteboard', 'overhead'):
+        cur = read_ai_mode()
+        return _status_result(option, cur == option, is_on=(cur == option), display='on' if cur == option else 'off')
+
+    if option == 'mode':
+        cur = read_ai_mode()
+        return _status_result(option, cur, display=cur)
+
+    if option == 'hdr':
+        v = _bitmask_get_bit(BIT_HDR);          return _status_result(option, v, is_on=v)
+    if option == 'mirror':
+        v = _bitmask_get_bit(BIT_MIRROR);       return _status_result(option, v, is_on=v)
+    if option == 'gesture-zoom':
+        v = _bitmask_get_bit(BIT_GESTURE_ZOOM); return _status_result(option, v, is_on=v)
+
+    if option == 'autoexposure':
+        v = _uvc_get(9, 0x1e, 1) == bytes([2]); return _status_result(option, v, is_on=v)
+    if option == 'awb':
+        v = _uvc_get(5, 0x0B, 1) == bytes([1]); return _status_result(option, v, is_on=v)
+    if option == 'autofocus':
+        v = _uvc_get(1, 0x08, 1) == bytes([1]); return _status_result(option, v, is_on=v)
+
+    if option == 'anti-flicker':
+        raw = _uvc_get(5, 0x05, 1)[0]
+        name = AF_MAP_INV.get(raw, f'unknown({raw})')
+        return _status_result(option, name, display=name)
+    if option == 'smartcomp-frame':
+        raw = _uvc_get(9, FRAMING_SEL, 1)[0]
+        name = {1: 'head', 2: 'halfbody', 3: 'wholebody'}.get(raw, f'unknown({raw})')
+        return _status_result(option, name, display=name)
+
+    if option == 'brightness':   return _status_result(option, _uvc_get(5, 0x02, 1)[0])
+    if option == 'contrast':     return _status_result(option, _uvc_get(5, 0x03, 1)[0])
+    if option == 'saturation':   return _status_result(option, struct.unpack('<H', _uvc_get(5, 0x07, 2))[0])
+    if option == 'sharpness':    return _status_result(option, struct.unpack('<H', _uvc_get(5, 0x08, 2))[0])
+    if option == 'wb-temp':      return _status_result(option, struct.unpack('<H', _uvc_get(5, 0x0A, 2))[0])
+    if option == 'exposurecomp': return _status_result(option, _ec_wire_to_user(_uvc_get(9, 0x09, 2)))
+
+    if option == 'zoom':         return _status_result(option, read_zoom())
+    if option in ('pan', 'tilt'):
+        pan, tilt = read_pantilt()
+        return _status_result(option, pan if option == 'pan' else tilt)
+
+    raise KeyError(f"USB read for {option!r} not implemented")
+
+
+def read_status_ws(option: str, dev: dict) -> dict:
+    """Read one option's state from a WebSocket DeviceInfoNotify payload."""
+    meta = STATUS_OPTIONS.get(option)
+    if not meta or not meta['ws']:
+        raise KeyError(f"option {option!r} not readable via WebSocket")
+
+    if option in ('track', 'deskview', 'whiteboard', 'overhead'):
+        want = {'track': VideoMode.TRACKING, 'deskview': VideoMode.DESKVIEW,
+                'whiteboard': VideoMode.WHITEBOARD, 'overhead': VideoMode.OVERHEAD}[option]
+        on = dev.get('mode') == want
+        return _status_result(option, on, is_on=on)
+    if option == 'mode':
+        m = dev.get('mode')
+        name = {VideoMode.NORMAL: 'normal', VideoMode.TRACKING: 'track',
+                VideoMode.DESKVIEW: 'deskview', VideoMode.WHITEBOARD: 'whiteboard',
+                VideoMode.OVERHEAD: 'overhead'}.get(m, f'unknown({m})')
+        return _status_result(option, name, display=name)
+
+    bool_map = {'hdr': 'hdr', 'mirror': 'mirror',
+                'autoexposure': 'autoExposure', 'awb': 'autoWhiteBalance',
+                'smartcomposition': 'smartComposition'}
+    if option in bool_map:
+        v = bool(dev.get(bool_map[option]))
+        return _status_result(option, v, is_on=v)
+
+    scalar_map = {'brightness': 'brightness', 'contrast': 'contrast',
+                  'saturation': 'saturation', 'sharpness': 'sharpness',
+                  'exposurecomp': 'exposureComp', 'wb-temp': 'wbTemp'}
+    if option in scalar_map:
+        return _status_result(option, dev.get(scalar_map[option]))
+    if option == 'zoom':
+        return _status_result(option, (dev.get('zoom') or {}).get('curValue'))
+
+    raise KeyError(f"WS read for {option!r} not implemented")
+
+
+def read_status_linux(option: str) -> dict:
+    """Read one option's state via v4l2-ctl --get-ctrl."""
+    meta = STATUS_OPTIONS.get(option)
+    if not meta or not meta['linux']:
+        raise KeyError(f"option {option!r} not readable on Linux")
+
+    device = os.environ.get('LINK_CTL_V4L2_DEVICE', '/dev/video0')
+
+    def _get(name: str) -> str:
+        r = subprocess.run(['v4l2-ctl', '-d', device, '--get-ctrl', name],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"v4l2-ctl --get-ctrl {name} failed: {r.stderr.strip()}")
+        # output: "name: 42"
+        _, _, val = r.stdout.partition(':')
+        return val.strip()
+
+    ctrl_map = {
+        'brightness':   'brightness',
+        'contrast':     'contrast',
+        'saturation':   'saturation',
+        'sharpness':    'sharpness',
+        'wb-temp':      'white_balance_temperature',
+        'zoom':         'zoom_absolute',
+        'pan':          'pan_absolute',
+        'tilt':         'tilt_absolute',
+    }
+    if option in ctrl_map:
+        return _status_result(option, int(_get(ctrl_map[option])))
+
+    if option == 'autoexposure':
+        # UVC auto_exposure: 1=manual, 3=aperture-priority/auto
+        v = int(_get('auto_exposure')) != 1
+        return _status_result(option, v, is_on=v)
+    if option == 'awb':
+        v = int(_get('white_balance_temperature_auto')) == 1
+        return _status_result(option, v, is_on=v)
+    if option == 'autofocus':
+        # Newer kernel name is focus_automatic_continuous; older is focus_auto.
+        try:    raw = _get('focus_automatic_continuous')
+        except Exception: raw = _get('focus_auto')
+        v = int(raw) == 1
+        return _status_result(option, v, is_on=v)
+    if option == 'anti-flicker':
+        # UVC power_line_frequency: 0=disabled, 1=50Hz, 2=60Hz, 3=auto
+        plf = int(_get('power_line_frequency'))
+        name = {0: 'disabled', 1: '50hz', 2: '60hz', 3: 'auto'}.get(plf, f'unknown({plf})')
+        return _status_result(option, name, display=name)
+
+    raise KeyError(f"Linux read for {option!r} not implemented")
+
+
+def _emit_status(result: dict, *, quiet: bool, json_out: bool) -> int:
+    """Print status result and return process exit code."""
+    if json_out:
+        print(json.dumps(result))
+    elif not quiet:
+        print(result['display'])
+    # Exit 0 if is_on is True or None (scalars/enums with no bool semantics
+    # always succeed). Exit 1 only when is_on is explicitly False.
+    return 0 if result.get('is_on') is not False else 1
 
 
 # ── USB-direct PTZ commands ──────────────────────────────────────────────────
@@ -616,7 +817,9 @@ USB_TILT_STEP = 3000
 def usb_image_dispatch(args) -> None:
     """USB-direct image and AI-mode commands via uvc-probe — no WebSocket,
     no Link Controller, no token required. Covers every control the desktop
-    app exposes except firmware update / device rename / factory reset."""
+    app exposes except firmware update / device rename / factory reset.
+    Note: `state == 'status'` is intercepted earlier in main() and never
+    reaches this dispatcher; status reads bypass mutation paths entirely."""
     cmd = args.command
     try:
         # ── Bitmask-bit controls (HDR / mirror / gesture-zoom) ────────────────
@@ -1311,22 +1514,106 @@ async def cmd_discover(verbose: bool = False, debug: bool = False, port_override
         sys.exit(2)
 
 # ── cmd: status ──────────────────────────────────────────────────────────────
+# `link-ctl status [option]` is the top-level status query. With an option it
+# reads exactly one value (same exit-code semantics as `link-ctl <opt> status`).
+# Without an option it dumps every readable option for the active backend as
+# JSON (default) or a human-readable table. Backend selection:
+#   • macOS with USB-direct  → no WS connection, no Link Controller, no token
+#   • Linux                  → v4l2-ctl (image scalars + AE/AWB/AF/anti-flicker)
+#   • Windows / WS fallback  → DeviceInfoNotify from one handshake
 
-async def cmd_status(port: int, debug: bool = False):
+def cmd_status_query(args) -> int:
+    """Dispatch `link-ctl status [option]`. Returns process exit code."""
+    option   = getattr(args, 'option', None)
+    quiet    = getattr(args, 'status_quiet', False)
+    json_out = getattr(args, 'status_json', False)
+    system   = platform.system()
+
+    # ── Per-option read (single value) ───────────────────────────────────────
+    if option:
+        meta = STATUS_OPTIONS[option]
+        try:
+            if system == 'Darwin' and meta['usb'] and _uvc_probe_available():
+                result = read_status_usb(option)
+            elif system == 'Linux' and meta['linux']:
+                result = read_status_linux(option)
+            elif meta['ws']:
+                # WS fallback (Windows always; macOS for smartcomposition; or
+                # Linux when explicitly forced — though usually unreachable).
+                port = asyncio.run(preflight(debug=args.debug, port_override=args.port))
+                result = asyncio.run(_status_via_ws(port, option, args.debug))
+            else:
+                _warn(f"✗ {option!r} is not readable on {system}.")
+                return 4
+        except Exception as e:
+            _warn(f'✗ status {option} failed: {e}')
+            return 3
+        return _emit_status(result, quiet=quiet, json_out=json_out)
+
+    # ── Full dump (no option) ────────────────────────────────────────────────
+    results: dict[str, dict] = {}
+    errors:  dict[str, str]  = {}
+
+    if system == 'Darwin' and _uvc_probe_available():
+        for opt, m in STATUS_OPTIONS.items():
+            if not m['usb']: continue
+            try:    results[opt] = read_status_usb(opt)
+            except Exception as e: errors[opt] = str(e)
+    elif system == 'Linux':
+        for opt, m in STATUS_OPTIONS.items():
+            if not m['linux']: continue
+            try:    results[opt] = read_status_linux(opt)
+            except Exception as e: errors[opt] = str(e)
+    else:
+        # WS dump: single handshake, decode every option from device_info.
+        port = asyncio.run(preflight(debug=args.debug, port_override=args.port))
+        try:
+            ws_dump = asyncio.run(_status_dump_via_ws(port, args.debug))
+            results.update(ws_dump)
+        except Exception as e:
+            _warn(f'✗ status dump failed: {e}')
+            return 3
+
+    if json_out:
+        out = {k: v for k, v in results.items()}
+        if errors: out['_errors'] = errors
+        print(json.dumps(out, indent=2))
+    elif not quiet:
+        width = max((len(k) for k in results), default=10)
+        for opt, r in results.items():
+            print(f"{opt:<{width}}  {r['display']}")
+        for opt, err in errors.items():
+            print(f"{opt:<{width}}  (error: {err})", file=sys.stderr)
+    return 0
+
+
+async def _status_via_ws(port: int, option: str, debug: bool) -> dict:
     client, err = await _connect_with_token_cycling(port, debug=debug)
     if client is None:
-        print(f"✗ {err}", file=sys.stderr)
-        sys.exit(3)
+        raise RuntimeError(err)
+    try:
+        devs = (client.device_info or {}).get('devices', [])
+        dev  = devs[0] if devs else {}
+        return read_status_ws(option, dev)
+    finally:
+        await client.close()
 
-    state = load_state()
-    output = {
-        'port':            port,
-        'deviceSerialNum': client.serial,
-        'deviceInfo':      client.device_info,
-        'cachedState':     state,
-    }
-    print(json.dumps(output, indent=2))
-    await client.close()
+
+async def _status_dump_via_ws(port: int, debug: bool) -> dict[str, dict]:
+    client, err = await _connect_with_token_cycling(port, debug=debug)
+    if client is None:
+        raise RuntimeError(err)
+    try:
+        devs = (client.device_info or {}).get('devices', [])
+        dev  = devs[0] if devs else {}
+        out: dict[str, dict] = {}
+        for opt, m in STATUS_OPTIONS.items():
+            if not m['ws']: continue
+            try: out[opt] = read_status_ws(opt, dev)
+            except Exception: pass
+        return out
+    finally:
+        await client.close()
 
 # ── Linux PTZ fallback ───────────────────────────────────────────────────────
 
@@ -1971,22 +2258,22 @@ def build_parser() -> argparse.ArgumentParser:
   center                  reset pan, tilt, and zoom to defaults
 
   ── AI modes  (USB-direct on macOS; WS elsewhere) ──────────────────
-  track        [on|off|toggle]   subject tracking
-  deskview     [on|off|toggle]   desk surface view
-  whiteboard   [on|off|toggle]   whiteboard mode
-  overhead     [on|off|toggle]   overhead / top-down view
-  normal                         return to standard mode
+  track        [on|off|toggle|status]   subject tracking
+  deskview     [on|off|toggle|status]   desk surface view
+  whiteboard   [on|off|toggle|status]   whiteboard mode
+  overhead     [on|off|toggle|status]   overhead / top-down view
+  normal                                return to standard mode
 
   ── Image settings  (USB-direct on macOS; WS elsewhere) ────────────
-  hdr              [on|off|toggle]   HDR
-  autofocus         on|off           auto focus  (explicit arg required)
-  autoexposure     [on|off|toggle]   auto exposure
-  awb              [on|off|toggle]   auto white balance
-  mirror           [on|off|toggle]   horizontal flip
-  gesture-zoom     [on|off|toggle]   gesture control zoom
-  anti-flicker     auto|50hz|60hz    anti-flicker mode
-  smartcomposition [on|off|toggle]   smart composition
-  smartcomp-frame  head|halfbody|wholebody   smart composition framing mode
+  hdr              [on|off|toggle|status]   HDR
+  autofocus         on|off|status           auto focus
+  autoexposure     [on|off|toggle|status]   auto exposure
+  awb              [on|off|toggle|status]   auto white balance
+  mirror           [on|off|toggle|status]   horizontal flip
+  gesture-zoom     [on|off|toggle|status]   gesture control zoom
+  anti-flicker     auto|50hz|60hz|status    anti-flicker mode
+  smartcomposition [on|off|toggle|status]   smart composition
+  smartcomp-frame  head|halfbody|wholebody|status   smart composition framing
   brightness  <0-100>    brightness  (default 50)
   contrast    <0-100>    contrast    (default 50)
   saturation  <0-100>    saturation  (default 50; 0 = greyscale)
@@ -2008,11 +2295,16 @@ def build_parser() -> argparse.ArgumentParser:
   joystick                      curses-based PTZ + preset UI
 
   ── Diagnostics ─────────────────────────────────────────────────────
-  status                 show device info as JSON
-  discover [--verbose]   find WebSocket port and cache it
-  preflight              run all checks (process, USB, port, handshake)
+  status [option] [--json] [-q]   query camera state
+                                  (no option = dump everything readable)
+  discover [--verbose]            find WebSocket port and cache it
+  preflight                       run all checks (process, USB, port, handshake)
 
-toggle commands: omit the argument to smart-toggle based on current state
+toggle commands: omit the argument to smart-toggle based on current state.
+status: bool options exit 0 if on / 1 if off; enums and scalars exit 0 and
+print the current value to stdout. Equivalent forms:
+  link-ctl track status            <=>  link-ctl status track
+  link-ctl brightness  → (no read)      link-ctl status brightness
 """,
     )
     p.add_argument('-d', '--debug',   action='store_true', help='Hex-dump WebSocket frames (stderr)')
@@ -2035,10 +2327,10 @@ toggle commands: omit the argument to smart-toggle based on current state
 
 
     # AI modes
-    s = sub.add_parser('track');     s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle'])
-    s = sub.add_parser('deskview');  s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle'])
-    s = sub.add_parser('whiteboard'); s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle'])
-    s = sub.add_parser('overhead');  s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle'])
+    s = sub.add_parser('track');     s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
+    s = sub.add_parser('deskview');  s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
+    s = sub.add_parser('whiteboard'); s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
+    s = sub.add_parser('overhead');  s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
     sub.add_parser('normal')
 
     # Presets. When tools/uvc-probe is available (macOS), these go through the
@@ -2064,24 +2356,30 @@ toggle commands: omit the argument to smart-toggle based on current state
     sub.add_parser('joystick', help='interactive curses PTZ + preset UI')
 
     # Image settings
-    s = sub.add_parser('hdr');              s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle'])
-    s = sub.add_parser('autofocus');        s.add_argument('state', choices=['on', 'off'])  # no smart toggle: state not readable
-    s = sub.add_parser('autoexposure');     s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle'])
-    s = sub.add_parser('awb');              s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle'])
-    s = sub.add_parser('mirror');           s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle'])
-    s = sub.add_parser('smartcomposition'); s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle'])
-    s = sub.add_parser('smartcomp-frame');  s.add_argument('frame', choices=['head', 'halfbody', 'wholebody'])
+    s = sub.add_parser('hdr');              s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
+    s = sub.add_parser('autofocus');        s.add_argument('state', choices=['on', 'off', 'status'])
+    s = sub.add_parser('autoexposure');     s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
+    s = sub.add_parser('awb');              s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
+    s = sub.add_parser('mirror');           s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
+    s = sub.add_parser('smartcomposition'); s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
+    s = sub.add_parser('smartcomp-frame');  s.add_argument('frame', choices=['head', 'halfbody', 'wholebody', 'status'])
     s = sub.add_parser('brightness');    s.add_argument('value', type=int)
     s = sub.add_parser('contrast');      s.add_argument('value', type=int)
     s = sub.add_parser('saturation');    s.add_argument('value', type=int)
     s = sub.add_parser('sharpness');     s.add_argument('value', type=int)
     s = sub.add_parser('exposurecomp');  s.add_argument('value', type=int, help='Exposure compensation 0..100 (50 = 0 EV)')
     s = sub.add_parser('wb-temp');       s.add_argument('value', type=int, help='White balance temperature 2800..10000 K (AWB must be off)')
-    s = sub.add_parser('gesture-zoom');  s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle'])
-    s = sub.add_parser('anti-flicker');  s.add_argument('mode', choices=['auto', '50hz', '60hz'])
+    s = sub.add_parser('gesture-zoom');  s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
+    s = sub.add_parser('anti-flicker');  s.add_argument('mode', choices=['auto', '50hz', '60hz', 'status'])
 
     # Diagnostics
-    sub.add_parser('status')
+    s = sub.add_parser('status', help='query camera state (per-option or full dump)')
+    s.add_argument('option', nargs='?', choices=sorted(STATUS_OPTIONS.keys()),
+                   help='option to query; omit for full state dump')
+    s.add_argument('-q', '--quiet', dest='status_quiet', action='store_true',
+                   help='exit-code only; no stdout')
+    s.add_argument('--json', dest='status_json', action='store_true',
+                   help='emit machine-readable JSON')
     s = sub.add_parser('discover');  s.add_argument('--verbose', action='store_true')
     sub.add_parser('preflight')
 
@@ -2116,6 +2414,33 @@ def main():
     if cmd == 'preflight':
         asyncio.run(cmd_preflight_check(debug=debug, port_override=args.port))
         return
+
+    if cmd == 'status':
+        sys.exit(cmd_status_query(args))
+
+    # ── Per-option `<cmd> status` short-circuit ───────────────────────────────
+    # Identical semantics to `link-ctl status <cmd>`: read-only, no setters
+    # invoked. Routed to the best available backend without going through the
+    # subcommand's own dispatcher (which would otherwise try to mutate state).
+    _status_arg = (getattr(args, 'state', None) or getattr(args, 'mode', None)
+                or getattr(args, 'frame', None))
+    if _status_arg == 'status' and cmd in STATUS_OPTIONS:
+        meta = STATUS_OPTIONS[cmd]
+        try:
+            if system == 'Darwin' and meta['usb'] and _uvc_probe_available():
+                result = read_status_usb(cmd)
+            elif system == 'Linux' and meta['linux']:
+                result = read_status_linux(cmd)
+            elif meta['ws']:
+                port = asyncio.run(preflight(debug=debug, port_override=args.port))
+                result = asyncio.run(_status_via_ws(port, cmd, debug))
+            else:
+                _warn(f"✗ {cmd!r} status is not available on {system}.")
+                sys.exit(4)
+        except Exception as e:
+            _warn(f'✗ {cmd} status failed: {e}')
+            sys.exit(3)
+        sys.exit(_emit_status(result, quiet=False, json_out=False))
 
     # ── USB-direct commands (no WebSocket, no Link Controller, no token) ──────
     if cmd == 'joystick':

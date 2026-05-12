@@ -168,7 +168,7 @@ Legend: ✅ confirmed + validated · ⚠️ confirmed sent, limited/no readback 
 
 | UI Feature | CLI Command | paramType | validate.py | Notes |
 |---|---|---|---|---|
-| Status | `status` | — | — | JSON dump of all DeviceInfo fields |
+| Status | `status [option]` / `<option> status` | — | — | Per-option query (bool → exit 0/1) or full dump |
 | Preflight | `preflight` | — | — | Checks process, USB, port, handshake |
 | Port discovery | `discover` | — | — | lsof → priority ports → range scan |
 
@@ -238,8 +238,12 @@ link-ctl preflight
 # Find the WebSocket port
 link-ctl discover
 
-# Show current device state
+# Show current device state (table of every readable option)
 link-ctl status
+
+# Read one value; exit 0 if tracking is on, 1 otherwise
+link-ctl track status
+if link-ctl track status -q; then echo "tracking is on"; fi
 
 # Center the camera
 link-ctl center
@@ -249,9 +253,6 @@ link-ctl track on
 
 # Zoom in
 link-ctl zoom 200
-
-# Enter privacy mode (lens points straight down)
-link-ctl privacy on
 ```
 
 ---
@@ -279,42 +280,47 @@ on each axis.
 
 ### AI Modes
 
-All AI mode commands accept `on`, `off`, or `toggle`. Omitting the argument
-smart-toggles based on the current mode.
+All AI mode commands accept `on`, `off`, `toggle`, or `status`. Omitting the
+argument smart-toggles based on the current mode. `status` reads the current
+mode without mutating and exits 0 if the named mode is active, 1 otherwise.
 
 ```bash
-link-ctl track [on|off|toggle]      # Subject tracking
-link-ctl deskview [on|off|toggle]   # DeskView (desk surface view)
-link-ctl whiteboard [on|off|toggle] # Whiteboard mode
-link-ctl overhead [on|off|toggle]   # Overhead / top-down
-link-ctl normal                     # Return to standard mode (clears all AI modes)
+link-ctl track [on|off|toggle|status]      # Subject tracking
+link-ctl deskview [on|off|toggle|status]   # DeskView (desk surface view)
+link-ctl whiteboard [on|off|toggle|status] # Whiteboard mode
+link-ctl overhead [on|off|toggle|status]   # Overhead / top-down
+link-ctl normal                            # Return to standard mode (clears all AI modes)
 ```
 
 ### Image Settings
 
-Toggle commands accept `on`, `off`, or `toggle`. Omitting the argument
-smart-toggles based on current device state. Exceptions:
-- `autofocus` — requires explicit `on` or `off`; camera does not report autofocus state
-- `mirror` — toggle defaults to `on` when state is unknown (DeviceInfo mirror field is unreliable)
-- `gesture-zoom` — toggle defaults to `on` when state is unknown (no DeviceInfo readback)
+Toggle commands accept `on`, `off`, `toggle`, or `status`. Omitting the
+argument smart-toggles based on current device state; `status` reads the
+current state and exits 0 (on) or 1 (off) without mutating. Exceptions:
+- `autofocus` — requires explicit `on`, `off`, or `status`
+- `mirror` — toggle defaults to `on` when state is unknown (DeviceInfo mirror field is unreliable; USB-direct read is authoritative)
+- `gesture-zoom` — toggle defaults to `on` when state is unknown on the WS path
 
 ```bash
-link-ctl hdr [on|off|toggle]               # HDR
-link-ctl autoexposure [on|off|toggle]      # Auto exposure
-link-ctl awb [on|off|toggle]               # Auto white balance
-link-ctl smartcomposition [on|off|toggle]  # Smart Composition (requires AI tracking on)
-link-ctl smartcomp-frame head|halfbody|wholebody  # Smart Composition framing
-link-ctl autofocus on|off                  # Auto focus (explicit on/off; no readback)
-link-ctl anti-flicker auto|50hz|60hz      # Anti-flicker mode
-link-ctl brightness <0-100>               # Brightness (default 50)
-link-ctl contrast <0-100>                 # Contrast (default 50)
-link-ctl saturation <0-100>               # Saturation (default 50; 0 = greyscale)
-link-ctl sharpness <0-100>               # Sharpness (default 50)
-link-ctl exposurecomp <0-100>            # Exposure compensation (50 = 0 EV; AE must be off)
-link-ctl wb-temp <2800-10000>            # WB temperature in Kelvin (AWB must be off)
-link-ctl mirror [on|off|toggle]          # Horizontal flip (toggle defaults to on)
-link-ctl gesture-zoom [on|off|toggle]    # Gesture control zoom (toggle defaults to on)
+link-ctl hdr [on|off|toggle|status]               # HDR
+link-ctl autoexposure [on|off|toggle|status]      # Auto exposure
+link-ctl awb [on|off|toggle|status]               # Auto white balance
+link-ctl smartcomposition [on|off|toggle|status]  # Smart Composition (requires AI tracking on)
+link-ctl smartcomp-frame head|halfbody|wholebody|status  # Smart Composition framing
+link-ctl autofocus on|off|status                  # Auto focus
+link-ctl anti-flicker auto|50hz|60hz|status       # Anti-flicker mode
+link-ctl brightness <0-100>                       # Brightness (default 50)
+link-ctl contrast <0-100>                         # Contrast (default 50)
+link-ctl saturation <0-100>                       # Saturation (default 50; 0 = greyscale)
+link-ctl sharpness <0-100>                        # Sharpness (default 50)
+link-ctl exposurecomp <0-100>                     # Exposure compensation (50 = 0 EV; AE must be off)
+link-ctl wb-temp <2800-10000>                     # WB temperature in Kelvin (AWB must be off)
+link-ctl mirror [on|off|toggle|status]            # Horizontal flip
+link-ctl gesture-zoom [on|off|toggle|status]      # Gesture control zoom
 ```
+
+Scalar settings (brightness/contrast/etc.) are read via the top-level
+`link-ctl status <option>` form — see Diagnostics below.
 
 ### Presets
 
@@ -380,11 +386,29 @@ the `preset-*` CLI commands.
 ### Diagnostics
 
 ```bash
-link-ctl preflight          # Run all validation checks (process, USB, port, handshake)
-link-ctl discover           # Find the WebSocket port and cache it
-link-ctl discover --verbose # Show every port tried during scan
-link-ctl status             # Dump full device info as JSON
+link-ctl preflight                  # Run all validation checks (process, USB, port, handshake)
+link-ctl discover                   # Find the WebSocket port and cache it
+link-ctl discover --verbose         # Show every port tried during scan
+link-ctl status                     # Table of every readable option
+link-ctl status --json              # Same, as JSON
+link-ctl status <option>            # One value to stdout; exit 0/1 for bools
+link-ctl status <option> -q         # Silent; exit code only
+link-ctl status <option> --json     # {"option": ..., "value": ..., "is_on": ...}
 ```
+
+`link-ctl status <opt>` and `link-ctl <opt> status` are equivalent for any
+option that takes a state arg (track, hdr, mirror, etc.). Scalar settings
+(brightness, contrast, zoom, …) are only readable via the top-level form.
+
+**Exit codes for status:**
+- Boolean options (`hdr`, `mirror`, `awb`, `autoexposure`, `autofocus`,
+  `gesture-zoom`, `smartcomposition`) and AI-mode names (`track`,
+  `deskview`, `whiteboard`, `overhead`): **0 if on, 1 if off**. Matches
+  `systemctl is-active` / `grep` convention so you can write
+  `if link-ctl track status; then …`.
+- Enums (`anti-flicker`, `smartcomp-frame`, `mode`) and scalars
+  (`brightness`, `zoom`, etc.): exit 0; current value to stdout.
+- Read failure: exit 3. Option unavailable on this platform: exit 4.
 
 ### Global Flags
 
