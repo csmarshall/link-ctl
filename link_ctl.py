@@ -609,10 +609,12 @@ def _ai_mode_len() -> int:
 
 def write_ai_mode(mode_name: str) -> None:
     mode_id, flag = AI_MODE_BYTES[mode_name]
-    buf = bytearray(_ai_mode_len())
+    ln = _ai_mode_len()
+    buf = bytearray(_uvc_get(9, AI_MODE_SEL, ln))
     buf[0] = mode_id
     buf[1] = flag
     _uvc_set(9, AI_MODE_SEL, bytes(buf))
+    time.sleep(1.5)  # firmware reports 0xFF during transition (API.md)
 
 def read_ai_mode() -> str:
     """Read the current video mode."""
@@ -623,6 +625,13 @@ def read_ai_mode() -> str:
         except Exception: continue
     if not raw: return 'unknown'
     mid = raw[0]; flag = raw[1] if len(raw) > 1 else 0
+    if mid == 0xFF:
+        time.sleep(0.5)
+        try:
+            raw = _uvc_get(9, AI_MODE_SEL, _ai_mode_len())
+            mid = raw[0]; flag = raw[1] if len(raw) > 1 else 0
+        except Exception:
+            pass
     for name, (m, f) in AI_MODE_BYTES.items():
         if m == mid and (len(raw) < 2 or f == flag):
             return name

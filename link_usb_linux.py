@@ -27,6 +27,52 @@ _PROBE = Path(__file__).resolve().parent / 'tools' / 'uvc-probe-linux'
 if platform.system() != 'Linux':
     raise ImportError('link_usb_linux requires Linux')
 
+INSTA360_VID = 0x2E1A
+
+
+def _probe_xu_set(unit: int, sel: int, data: bytes) -> bool:
+    """Last-resort XU SET via uvc-probe-linux --detach; rebinds uvcvideo after."""
+    import subprocess
+    if not _PROBE.is_file():
+        return False
+    r = subprocess.run(
+        [str(_PROBE), '--detach', 'set', str(unit), f'0x{sel:02x}', data.hex()],
+        capture_output=True, text=True, timeout=10)
+    if r.returncode != 0:
+        return False
+    _rebind_uvcvideo()
+    return True
+
+
+def _rebind_uvcvideo() -> None:
+    """Re-attach uvcvideo after a transient --detach probe operation."""
+    bind = Path('/sys/bus/usb/drivers/uvcvideo/bind')
+    if not bind.is_file():
+        return
+    sysfs = Path('/sys/bus/usb/devices')
+    for entry in sysfs.iterdir():
+        name = entry.name
+        if ':1.0' not in name and ':1.1' not in name:
+            continue
+        dev = name.split(':')[0]
+        vid = sysfs / dev / 'idVendor'
+        if not vid.exists() or vid.read_text().strip() != f'{INSTA360_VID:04x}':
+            continue
+        try:
+            bind.write_text(name + '\n')
+        except OSError:
+            pass
+
+
+def _invalidate_handle() -> None:
+    global _handle
+    if _handle is not None:
+        try:
+            _handle.close()
+        except Exception:
+            pass
+        _handle = None
+
 # ── libusb ctypes ────────────────────────────────────────────────────────────
 
 _libusb = ctypes.CDLL('libusb-1.0.so.0')
@@ -62,8 +108,9 @@ _libusb.libusb_detach_kernel_driver.argtypes = [LibusbDeviceHandle, c_int]
 _libusb.libusb_detach_kernel_driver.restype = c_int
 _libusb.libusb_attach_kernel_driver.argtypes = [LibusbDeviceHandle, c_int]
 _libusb.libusb_attach_kernel_driver.restype = c_int
+_libusb.libusb_strerror.argtypes = [c_int]
+_libusb.libusb_strerror.restype = ctypes.c_char_p
 
-INSTA360_VID = 0x2E1A
 SUPPORTED_PIDS = (0x4C01, 0x4C04, 0x4C02, 0x4C03)
 VC_IFACE_NUM = 0
 UVC_GET_CUR = 0x81
@@ -382,18 +429,6 @@ class LinuxUSBHandle:
             return
         raise RuntimeError(f'SET_CUR failed u={unit} s=0x{sel:02x}')
 
-    def _libusb_transfer_set(self, unit: int, sel: int, data: bytes) -> None:
-        if not self._libusb_ok:
-            raise RuntimeError('libusb not available for XU SET')
-        buf = (c_uint8 * len(data))(*data)
-        r = _libusb.libusb_control_transfer(
-            self.dev, 0x21, UVC_SET_CUR,
-            sel << 8, (unit << 8) | VC_IFACE_NUM,
-            buf, len(data), 1000)
-        if r < 0:
-            err = _libusb.libusb_strerror(r)
-            raise RuntimeError(f'libusb SET_CUR u={unit} s=0x{sel:02x}: {err.decode()}')
-
     def get(self, unit: int, sel: int, length: int) -> bytes:
         if unit in XU_UNITS:
             return self._ioctl.get(unit, sel, length)
@@ -401,19 +436,17 @@ class LinuxUSBHandle:
 
     def set(self, unit: int, sel: int, data: bytes) -> None:
         if unit in XU_UNITS:
-            # ioctl GET works for XU on Link 2, but multi-byte SET (AI mode, etc.)
-            # needs libusb — kernel ioctl SET_CUR succeeds yet is ignored by firmware.
-            if self._libusb_ok and len(data) > 2:
-                self._libusb_transfer_set(unit, sel, data)
-                return
+            # ioctl SET works for Link 2 XU (use RMW payloads from link_ctl).
+            # In-process libusb SET fails with EIO while uvcvideo is bound.
             try:
                 self._ioctl.set(unit, sel, data)
                 return
-            except Exception:
-                if self._libusb_ok:
-                    self._libusb_transfer_set(unit, sel, data)
-                    return
-                raise
+            except OSError as e:
+                last = e
+            if _probe_xu_set(unit, sel, data):
+                _invalidate_handle()
+                return
+            raise RuntimeError(f'XU SET failed u={unit} s=0x{sel:02x}: {last}')
         self._usb_set(unit, sel, data)
 
 
