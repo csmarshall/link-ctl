@@ -60,7 +60,7 @@ BUTTONS: list[tuple[int, str, str, str]] = [
     (9,  'Mirror',   '#9333ea', 'mirror_on.sh'),
     (10, 'Zoom +',   '#15803d', 'zoom_in.sh'),
     (11, 'Zoom −',   '#166534', 'zoom_out.sh'),
-    (12, 'Normal',   '#475569', 'normal.sh'),
+    (12, 'Reset',    '#c2410c', 'reset.sh'),
     (13, 'Privacy',  '#b91c1c', 'privacy_on.sh'),
     (14, 'Priv\nOff', '#991b1b', 'privacy_off.sh'),
 ]

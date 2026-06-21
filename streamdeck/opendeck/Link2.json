@@ -774,7 +774,7 @@
         "states": [
           {
             "alignment": "middle",
-            "background_colour": "#475569",
+            "background_colour": "#c2410c",
             "colour": "#FFFFFF",
             "family": "Liberation Sans",
             "image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIW2NgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg==",
@@ -785,7 +785,7 @@
             "stroke_colour": "#000000",
             "stroke_size": 2,
             "style": "Regular",
-            "text": "Normal",
+            "text": "Reset",
             "underline": false
           }
         ]
@@ -794,7 +794,7 @@
       "context": "Keypad.12.0",
       "current_state": 0,
       "settings": {
-        "down": "bash -lc '/home/jschools/Projects/link-ctl/streamdeck/normal.sh'",
+        "down": "bash -lc '/home/jschools/Projects/link-ctl/streamdeck/reset.sh'",
         "file": "",
         "rotate": "",
         "show": false,
@@ -803,7 +803,7 @@
       "states": [
         {
           "alignment": "middle",
-          "background_colour": "#475569",
+          "background_colour": "#c2410c",
           "colour": "#FFFFFF",
           "family": "Liberation Sans",
           "image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIW2NgYGD4DwABBAEAwS2OUAAAAABJRU5ErkJggg==",
@@ -814,7 +814,7 @@
           "stroke_colour": "#000000",
           "stroke_size": 2,
           "style": "Regular",
-          "text": "Normal",
+          "text": "Reset",
           "underline": false
         }
       ]
