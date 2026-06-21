@@ -336,8 +336,19 @@ class TestReadAiModeLink2(unittest.TestCase):
     def test_steady_overhead_ignores_stale_byte1(self):
         self.assertEqual(self._read(bytes([0x05, 0x10])), 'overhead')
 
-    def test_ff_stale_10_is_deskview_without_recent_write(self):
-        self.assertEqual(self._read(bytes([0xFF, 0x10])), 'deskview')
+    def test_ff_10_persistent_is_track(self):
+        self.assertEqual(self._read(bytes([0xFF, 0x10])), 'track')
+
+    def test_ff_10_settles_to_deskview(self):
+        reads = [
+            bytes([0xFF, 0x10] + [0] * 59),
+            bytes([0x06, 0x11] + [0] * 59),
+        ]
+        with mock.patch.object(link_ctl, '_ai_mode_get_raw', side_effect=reads):
+            with mock.patch.object(link_ctl, '_ai_mode_len', return_value=61):
+                with mock.patch.object(link_ctl, '_link2', return_value=True):
+                    link_ctl._last_ai_mode_written = None
+                    self.assertEqual(link_ctl.read_ai_mode(), 'deskview')
 
     def test_ff_stale_10_after_overhead_write_uses_last_written(self):
         link_ctl._last_ai_mode_written = 'overhead'

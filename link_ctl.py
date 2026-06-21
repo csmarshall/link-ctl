@@ -785,19 +785,21 @@ def read_ai_mode() -> str:
                     return link2_by_mode_id[mid]
             except Exception:
                 pass
-            # 0xFF/0x00 is a generic transition — not reliably track or normal.
+            if mid == 0x00:
+                return 'normal'
+            if mid in link2_by_mode_id:
+                return link2_by_mode_id[mid]
+            if flag == 0x11:
+                return 'deskview'
             if flag == 0x00:
                 return 'transition'
             link2_by_flag = {0x01: 'whiteboard', 0x03: 'overhead'}
             if flag in link2_by_flag:
                 return link2_by_flag[flag]
-            # 0x10 is the deskview SET flag but also stale in byte[1] during other modes.
-            if flag == 0x11:
-                return 'deskview'
-            if flag == 0x10:
-                if _last_ai_mode_written not in (None, 'deskview'):
-                    return 'transition'
-                return 'deskview'
+            # Persistent 0xFF/0x10 after settle is AI tracking on Link 2 (deskview
+            # reaches 0x06 within ~1s). Stale byte[1]=0x10 on steady GET otherwise.
+            if flag == 0x10 and mid == 0xFF:
+                return 'track'
             return 'transition'
     return f'unknown(0x{mid:02x}/0x{flag:02x})'
 
