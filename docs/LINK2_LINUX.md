@@ -62,18 +62,22 @@ SET (vrwallace / link-ctl `write_ai_mode`):
 
 | Mode | byte[0] | byte[1] | Notes |
 |------|---------|---------|-------|
-| Off / normal | `0x00` | `0x00` | Entire buffer must be zeroed |
+| Off / normal | `0x00` | `0x00` | Link 2: RMW — preserve tail bytes (offset 52+); zero-fill breaks mode SET |
 | Track | `0x01` | `0x00` | |
 | Whiteboard | `0x04` | `0x01` | |
-| Overhead | `0x05` | `0x03` | |
-| DeskView | `0x06` | `0x10` | Active readback: `0x06/0x11`; byte[1] `0x10` may linger after off |
+| Overhead | `0x05` | `0x03` | Exit current mode + disable privacy before SET on Link 2 |
+| DeskView | `0x06` | `0x10` | Active readback: `0x06/0x11` or `0xFF/0x10`; byte[1] `0x10` cleared on normal |
 
-**DeskView off:** `streamdeck/deskview_off.sh` calls `deskview off` then `center` to return the gimbal from the tilted-down desk position.
+**DeskView off:** `streamdeck/deskview_off.sh` calls `deskview off`, `normal`, then `center`.
+
+**Privacy readback:** use func-enable bit 11 on Link 2; unit 10/0x0F GET can echo `0x03fd` (func-enable) when idle.
 
 ### Open questions
 
-- [x] DeskView on/off — fixed: zero-fill SET + Link 2 readback for `0x06/0x11` and `0xFF/0x10`
-- [ ] AI mode readback verified on hardware for whiteboard/overhead (`tools/probe_ai_modes.py`)
+- [x] DeskView on/off — Link 2 RMW tail bytes + explicit normal + center on off
+- [x] Overhead — exit prior mode and disable privacy before SET; RMW not zero-fill
+- [x] Privacy readback — func-enable bit 11 (unit 10/0x0F GET unreliable)
+- [x] Mirror — func-enable bit 3 SET with verify/retry on Link 2
 - [ ] Smart composition master switch (bit 0 of `0x1B` — unconfirmed)
 - [ ] Full `snapshot` inventory diff vs OG Link
 

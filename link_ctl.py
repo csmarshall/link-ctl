@@ -578,7 +578,11 @@ def _bitmask_get() -> int:
 def _bitmask_set_bit(bit: int, on: bool) -> None:
     val = _bitmask_get()
     val = val | (1 << bit) if on else val & ~(1 << bit)
-    _uvc_set(BITMASK_UNIT, BITMASK_SEL, val.to_bytes(2, 'little'))
+    wire = val.to_bytes(2, 'little')
+    _uvc_set(BITMASK_UNIT, BITMASK_SEL, wire)
+    # Link 2 ioctl SET can appear to succeed while the bit does not stick; verify once.
+    if bool(_bitmask_get() & (1 << bit)) != on:
+        _uvc_set(BITMASK_UNIT, BITMASK_SEL, wire)
 
 def _bitmask_get_bit(bit: int) -> bool:
     return bool(_bitmask_get() & (1 << bit))
@@ -630,34 +634,90 @@ def _ai_mode_len() -> int:
     _ai_mode_len_cache = AI_MODE_LEN
     return AI_MODE_LEN
 
-def write_ai_mode(mode_name: str) -> None:
-    """Set AI video mode via XU9 sel 0x02.
+def _link2() -> bool:
+    """True when the open USB device is Link 2 / 2 Pro (not OG Link)."""
+    if platform.system() != 'Linux' or _usb_backend is None:
+        return False
+    try:
+        return _usb_backend.is_link2()
+    except Exception:
+        return False
 
-    Zero-fill the full buffer before writing byte[0]/byte[1]. Link 2 (61-byte)
-    rejects RMW that leaves stale tail bytes or a lingering mode flag in byte[1].
-    Matches vrwallace Insta360-Link-1-and-2-Controller-for-Linux XU_SetMode.
-    """
-    mode_id, flag = AI_MODE_BYTES[mode_name]
+def _ai_mode_get_raw() -> bytes:
+    """Read the AI mode buffer using the firmware-reported length."""
     ln = _ai_mode_len()
-    buf = bytearray(ln)  # zero entire buffer — do not read-modify-write
+    try:
+        return _uvc_get(9, AI_MODE_SEL, ln)
+    except OSError:
+        for fallback in (61, 52):
+            if fallback == ln:
+                continue
+            try:
+                return _uvc_get(9, AI_MODE_SEL, fallback)
+            except OSError:
+                continue
+        raise
+
+def _apply_ai_mode_buffer(mode_id: int, flag: int) -> None:
+    """Write byte[0]/byte[1] of the AI mode buffer (XU9 sel 0x02)."""
+    ln = _ai_mode_len()
+    if _link2() and ln >= 61:
+        # Link 2: preserve tail calibration bytes (offset 52+). Zero-fill wipes them
+        # and mode SET is ignored or misbehaves (overhead/deskview appear broken).
+        try:
+            buf = bytearray(_ai_mode_get_raw())
+        except OSError:
+            buf = bytearray(ln)
+    else:
+        buf = bytearray(ln)
     buf[0] = mode_id
     buf[1] = flag
     _uvc_set(9, AI_MODE_SEL, bytes(buf))
+
+def write_ai_mode(mode_name: str) -> None:
+    """Set AI video mode via XU9 sel 0x02.
+
+    OG Link: zero-fill 52-byte buffer. Link 2 (61-byte): read-modify-write so tail
+    bytes stay intact; always clear byte[1] when returning to normal so deskview
+    flag 0x10 does not linger. Exit the current mode and privacy before entering a
+    new AI mode on Link 2 (matches vrwallace SetCameraMode sequencing).
+    """
+    mode_id, flag = AI_MODE_BYTES[mode_name]
+    ln = _ai_mode_len()
+
+    if _link2() and ln >= 61 and mode_name != 'normal':
+        cur = read_ai_mode()
+        if cur not in ('normal', mode_name) and not cur.startswith('unknown'):
+            _apply_ai_mode_buffer(0, 0)
+            time.sleep(0.5)
+        if read_privacy():
+            write_privacy(False)
+            time.sleep(0.5)
+
+    if mode_name == 'normal' and _link2() and ln >= 61:
+        _apply_ai_mode_buffer(0, 0)
+    elif _link2() and ln >= 61:
+        _apply_ai_mode_buffer(mode_id, flag)
+    else:
+        buf = bytearray(ln)
+        buf[0] = mode_id
+        buf[1] = flag
+        _uvc_set(9, AI_MODE_SEL, bytes(buf))
     time.sleep(1.5)  # firmware reports 0xFF during transition (API.md)
 
 def read_ai_mode() -> str:
     """Read the current video mode."""
     raw = None
-    for length in (_ai_mode_len(), 61, 52, 2, 1):
-        try:
-            raw = _uvc_get(9, AI_MODE_SEL, length); break
-        except Exception: continue
+    try:
+        raw = _ai_mode_get_raw()
+    except OSError:
+        return 'unknown'
     if not raw: return 'unknown'
     mid = raw[0]; flag = raw[1] if len(raw) > 1 else 0
     if mid == 0xFF:
         time.sleep(0.5)
         try:
-            raw = _uvc_get(9, AI_MODE_SEL, _ai_mode_len())
+            raw = _ai_mode_get_raw()
             mid = raw[0]; flag = raw[1] if len(raw) > 1 else 0
         except Exception:
             pass
@@ -676,9 +736,9 @@ def read_ai_mode() -> str:
         link2_by_flag = {0x00: 'track', 0x01: 'whiteboard', 0x03: 'overhead'}
         if mid == 0xFF and flag in link2_by_flag:
             return link2_by_flag[flag]
-        # 0xFF/0x10 after deskview off is a stale byte[1]; active deskview uses byte[0]=0x06.
+        # Active deskview transition on Link 2: 0xFF/0x10 or 0xFF/0x11 (steady: byte[0]=0x06).
         if mid == 0xFF and flag in (0x10, 0x11):
-            return 'track'
+            return 'deskview'
     return f'unknown(0x{mid:02x}/0x{flag:02x})'
 
 # Link 2 / 2 Pro privacy (XU2 unit 10). OG Link ignores these writes.
@@ -720,14 +780,22 @@ def _privacy_wire(on: bool) -> bytes:
     return struct.pack('<H', val)
 
 def read_privacy() -> bool:
+    # Link 2: unit 10/0x0F GET often echoes func-enable (0x03fd) — bit 11 is authoritative.
+    if _link2():
+        return _bitmask_get_bit(BIT_PRIVACY)
     raw = _uvc_get(PRIVACY_UNIT, PRIVACY_SEL, _privacy_len())
     if len(raw) >= 2:
         return struct.unpack('<H', raw[:2])[0] != 0
     return raw[0] != 0
 
 def write_privacy(on: bool) -> None:
-    _uvc_set(PRIVACY_UNIT, PRIVACY_SEL, _privacy_wire(on))
+    # Physical gimbal-down privacy is driven by func-enable bit 11; unit 10/0x0F is secondary.
     _bitmask_set_bit(BIT_PRIVACY, on)
+    try:
+        _uvc_set(PRIVACY_UNIT, PRIVACY_SEL, _privacy_wire(on))
+    except Exception:
+        if not _link2():
+            raise
 
 # Smart framing (composition style) at unit 9 sel 0x13 (19), 1 byte.
 FRAMING_SEL = 0x13
