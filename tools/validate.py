@@ -530,6 +530,11 @@ def main():
             print(f'  {tc.name:20s}  {tc.description}')
         return
 
+    only = [n.strip() for n in args.only.split(',')] if args.only else []
+
+    if args.backend == 'usb':
+        sys.exit(run_usb_all(only))
+
     port = args.port
     token = None
 
@@ -553,11 +558,6 @@ def main():
 
     if not token:
         token = _read_token_from_ini() or ''
-
-    only = [n.strip() for n in args.only.split(',')] if args.only else []
-
-    if args.backend == 'usb':
-        sys.exit(run_usb_all(only))
 
     sys.exit(asyncio.run(run_all(port, token, only)))
 

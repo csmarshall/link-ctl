@@ -435,7 +435,8 @@ def _uvc_get(unit: int, sel: int, length: int) -> bytes:
         try:
             return _usb_backend.get(unit, sel, length)
         except Exception:
-            pass
+            if unit in (9, 10, 11):
+                raise
     r = subprocess.run(
         [str(UVC_PROBE), 'get', str(unit), f'0x{sel:02x}', str(length)],
         capture_output=True, text=True, timeout=3)
@@ -448,7 +449,8 @@ def _uvc_set(unit: int, sel: int, data: bytes) -> None:
         try:
             _usb_backend.set(unit, sel, data); return
         except Exception:
-            pass
+            if unit in (9, 10, 11):
+                raise
     r = subprocess.run(
         [str(UVC_PROBE), 'set', str(unit), f'0x{sel:02x}', data.hex()],
         capture_output=True, text=True, timeout=3)
@@ -573,10 +575,10 @@ def _bitmask_set_bit(bit: int, on: bool) -> None:
 def _bitmask_get_bit(bit: int) -> bool:
     return bool(_bitmask_get() & (1 << bit))
 
-# AI video-mode buffer at unit 9 sel 0x02 — 52 bytes, byte[0]=mode_id,
-# byte[1]=mode_flag, rest zero. vrwallace's map:
+# AI video-mode buffer at unit 9 sel 0x02 — byte[0]=mode_id, byte[1]=mode_flag,
+# rest zero. Link 2 reports GET_LEN=61; OG Link uses 52.
 AI_MODE_SEL   = 0x02
-AI_MODE_LEN   = 52
+AI_MODE_LEN   = 52   # default for OG Link; use _ai_mode_len() at runtime
 AI_MODE_BYTES = {
     'normal':     (0x00, 0x00),
     'track':      (0x01, 0x00),
@@ -585,19 +587,37 @@ AI_MODE_BYTES = {
     'deskview':   (0x06, 0x10),
 }
 
+_ai_mode_len_cache: int | None = None
+
+def _ai_mode_len() -> int:
+    """Return the firmware-reported AI mode buffer length (52 OG, 61 Link 2)."""
+    global _ai_mode_len_cache
+    if _ai_mode_len_cache is not None:
+        return _ai_mode_len_cache
+    try:
+        from link_usb import LinuxXUBackend
+        b = LinuxXUBackend(); b.open()
+        ln = b.xu_get_len(9, AI_MODE_SEL)
+        b.close()
+        if ln > 0:
+            _ai_mode_len_cache = ln
+            return ln
+    except Exception:
+        pass
+    _ai_mode_len_cache = AI_MODE_LEN
+    return AI_MODE_LEN
+
 def write_ai_mode(mode_name: str) -> None:
     mode_id, flag = AI_MODE_BYTES[mode_name]
-    buf = bytearray(AI_MODE_LEN)
+    buf = bytearray(_ai_mode_len())
     buf[0] = mode_id
     buf[1] = flag
     _uvc_set(9, AI_MODE_SEL, bytes(buf))
 
 def read_ai_mode() -> str:
-    """Read the current video mode. The firmware's GET_LEN reports 1 for
-    this selector even though SET_CUR accepts the full 52-byte AI buffer;
-    we try the short form first, then fall back to the long one."""
+    """Read the current video mode."""
     raw = None
-    for length in (1, 2, 52):
+    for length in (_ai_mode_len(), 61, 52, 2, 1):
         try:
             raw = _uvc_get(9, AI_MODE_SEL, length); break
         except Exception: continue

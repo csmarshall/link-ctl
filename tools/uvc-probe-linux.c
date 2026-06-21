@@ -391,6 +391,12 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Discovering selectors...\n");
         discover(h);
         fprintf(stderr, "Found %d readable selectors.\n", g_nknown);
+        if (g_nknown == 0 && !g_detach) {
+            fprintf(stderr,
+                    "Hint: while uvcvideo is bound, use ioctl snapshot instead:\n"
+                    "  python3 tools/xu_snapshot_linux.py\n"
+                    "Or retry with --detach (briefly releases the camera driver).\n");
+        }
 
         if (strcmp(mode, "snapshot") == 0) {
             print_entries(g_known, g_nknown);

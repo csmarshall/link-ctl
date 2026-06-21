@@ -18,7 +18,7 @@ Device: **Insta360 Link 2** (`2e1a:4c04`)
 
 | Sel | Len | Notes |
 |-----|-----|-------|
-| 0x02 | 61 | AI video mode payload (OG docs say 52 bytes — Link 2 uses 61) |
+| 0x02 | 61 | AI video mode — **SET via libusb** (ioctl SET is ignored); GET via ioctl |
 | 0x09 | 2 | Exposure compensation |
 | 0x1A | 8 | Pan/tilt readback: **tilt, pan** int32 LE |
 | 0x1B | 2 | Func-enable bitmask (`f50b` sample) |
@@ -54,7 +54,8 @@ python3 link_usb_linux.py
 python3 link_ctl.py status autoexposure
 python3 link_ctl.py track on
 python3 tools/validate.py --backend usb --only zoom,track,autoexposure
-./tools/uvc-probe-linux snapshot   # full selector inventory
+./tools/uvc-probe-linux snapshot   # libusb; use xu_snapshot_linux.py while streaming
+python3 tools/xu_snapshot_linux.py # ioctl snapshot (preferred on Linux)
 ```
 
 ## Sample XU9 sel 0x02 payload (61 bytes)

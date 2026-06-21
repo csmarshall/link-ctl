@@ -382,6 +382,18 @@ class LinuxUSBHandle:
             return
         raise RuntimeError(f'SET_CUR failed u={unit} s=0x{sel:02x}')
 
+    def _libusb_transfer_set(self, unit: int, sel: int, data: bytes) -> None:
+        if not self._libusb_ok:
+            raise RuntimeError('libusb not available for XU SET')
+        buf = (c_uint8 * len(data))(*data)
+        r = _libusb.libusb_control_transfer(
+            self.dev, 0x21, UVC_SET_CUR,
+            sel << 8, (unit << 8) | VC_IFACE_NUM,
+            buf, len(data), 1000)
+        if r < 0:
+            err = _libusb.libusb_strerror(r)
+            raise RuntimeError(f'libusb SET_CUR u={unit} s=0x{sel:02x}: {err.decode()}')
+
     def get(self, unit: int, sel: int, length: int) -> bytes:
         if unit in XU_UNITS:
             return self._ioctl.get(unit, sel, length)
@@ -389,9 +401,20 @@ class LinuxUSBHandle:
 
     def set(self, unit: int, sel: int, data: bytes) -> None:
         if unit in XU_UNITS:
-            self._ioctl.set(unit, sel, data)
-        else:
-            self._usb_set(unit, sel, data)
+            # ioctl GET works for XU on Link 2, but multi-byte SET (AI mode, etc.)
+            # needs libusb — kernel ioctl SET_CUR succeeds yet is ignored by firmware.
+            if self._libusb_ok and len(data) > 2:
+                self._libusb_transfer_set(unit, sel, data)
+                return
+            try:
+                self._ioctl.set(unit, sel, data)
+                return
+            except Exception:
+                if self._libusb_ok:
+                    self._libusb_transfer_set(unit, sel, data)
+                    return
+                raise
+        self._usb_set(unit, sel, data)
 
 
 _handle: LinuxUSBHandle | None = None
@@ -401,6 +424,12 @@ def _get_handle() -> LinuxUSBHandle:
     global _handle
     if _handle is None:
         _handle = LinuxUSBHandle()
+    else:
+        try:
+            _handle._ioctl.get(9, 0x1E, 1)
+        except Exception:
+            _handle.close()
+            _handle = LinuxUSBHandle()
     return _handle
 
 
