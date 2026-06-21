@@ -635,6 +635,10 @@ def read_ai_mode() -> str:
     for name, (m, f) in AI_MODE_BYTES.items():
         if m == mid and (len(raw) < 2 or f == flag):
             return name
+    # Link 2 (61-byte buffer): steady-state tracking reads byte[0]=0xFF, not 0x01.
+    # OG Link briefly shows 0xFF during transition then settles to 0x01.
+    if mid == 0xFF and _ai_mode_len() >= 61:
+        return 'track'
     return f'unknown(0x{mid:02x}/0x{flag:02x})'
 
 # Smart framing (composition style) at unit 9 sel 0x13 (19), 1 byte.

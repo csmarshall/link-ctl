@@ -18,7 +18,7 @@ Device: **Insta360 Link 2** (`2e1a:4c04`)
 
 | Sel | Len | Notes |
 |-----|-----|-------|
-| 0x02 | 61 | AI video mode — **SET via libusb** (ioctl SET is ignored); GET via ioctl |
+| 0x02 | 61 | AI video mode — SET via ioctl RMW; GET via ioctl. **Link 2 readback: byte[0]=0xFF when tracking** (OG Link uses 0x01) |
 | 0x09 | 2 | Exposure compensation |
 | 0x1A | 8 | Pan/tilt readback: **tilt, pan** int32 LE |
 | 0x1B | 2 | Func-enable bitmask (`f50b` sample) |
