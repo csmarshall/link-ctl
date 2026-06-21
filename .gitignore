@@ -7,6 +7,7 @@ dist/
 *.egg
 
 # Dev tool screenshots and captures
+tools/smoke_captures/
 gap-finder-screenshots/
 gap2-screenshots/
 *.txt
