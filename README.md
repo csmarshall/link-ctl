@@ -621,21 +621,39 @@ The `streamdeck/` directory contains ready-to-use shell scripts.
 
 ## Linux
 
-PTZ commands fall back to `v4l2-ctl` automatically:
+USB-direct control is supported on Linux via `link_usb_linux.py` (hybrid
+`UVCIOC_CTRL_QUERY` for extension units + libusb for CT/PU). Build the probe
+helper and optional udev rule:
 
 ```bash
-sudo apt install v4l-utils
-link-ctl zoom 200      # → v4l2-ctl -d /dev/video0 --set-ctrl zoom_absolute=200
-link-ctl pan-rel 5     # → v4l2-ctl -d /dev/video0 --set-ctrl pan_relative=5
+sudo apt install v4l-utils libusb-1.0-0-dev
+make -C tools uvc-probe-linux
+sudo cp tools/99-insta360-link.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-Override the device with:
 ```bash
-LINK_CTL_V4L2_DEVICE=/dev/video2 link-ctl zoom 150
+link-ctl track on          # AI modes via USB XU (no Link Controller app)
+link-ctl autoexposure off
+link-ctl hdr on
+link-ctl center            # PTZ via libusb CT registers
+link-ctl zoom 200
+link-ctl status hdr
+python3 tools/validate.py --backend usb
 ```
 
-AI modes and image settings exit with code 4 on Linux — they require the
-Link Controller app (macOS/Windows only).
+**Link 2 notes** (`2e1a:4c04`): V4L2 `pan_absolute`/`tilt_absolute` readback is
+broken on the stock driver; USB readback uses XU1 sel `0x1A`. See
+[`docs/LINK2_LINUX.md`](docs/LINK2_LINUX.md).
+
+Override the V4L2 device node:
+
+```bash
+LINK_CTL_V4L2_DEVICE=/dev/video2 link-ctl status zoom
+```
+
+If CT/PU libusb access fails, install the udev rule above or set
+`LINK_CTL_USB_DETACH=1` (briefly detaches `uvcvideo` during PTZ writes).
 
 ---
 

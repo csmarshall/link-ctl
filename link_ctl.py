@@ -390,7 +390,9 @@ def invalidate_port_cache():
 # (pan, tilt) order. We convert on each boundary; logical pan/tilt values
 # in this module are always in the natural (pan, tilt) sense.
 
-UVC_PROBE = Path(__file__).resolve().parent / 'tools' / 'uvc-probe'
+UVC_PROBE = Path(__file__).resolve().parent / 'tools' / (
+    'uvc-probe-linux' if platform.system() == 'Linux' else 'uvc-probe'
+)
 
 # Camera Terminal (unit 1) standard UVC controls
 CT_PANTILT_ABSOLUTE_SEL = 0x0D   # 8-byte: pan int32 LE + tilt int32 LE
@@ -409,6 +411,8 @@ _usb_backend = None
 try:
     if platform.system() == 'Darwin':
         import link_usb_macos as _usb_backend   # type: ignore
+    elif platform.system() == 'Linux':
+        import link_usb_linux as _usb_backend   # type: ignore
 except Exception:
     _usb_backend = None
 
@@ -422,6 +426,9 @@ def _uvc_probe_available() -> bool:
         except Exception:
             pass
     return UVC_PROBE.is_file() and os.access(UVC_PROBE, os.X_OK)
+
+def _linux_usb_status_available() -> bool:
+    return platform.system() == 'Linux' and _uvc_probe_available()
 
 def _uvc_get(unit: int, sel: int, length: int) -> bytes:
     if _usb_backend is not None:
@@ -1613,7 +1620,7 @@ def cmd_status_query(args) -> int:
     if option:
         meta = STATUS_OPTIONS[option]
         try:
-            if system == 'Darwin' and meta['usb'] and _uvc_probe_available():
+            if (system in ('Darwin', 'Linux')) and meta['usb'] and _uvc_probe_available():
                 result = read_status_usb(option)
             elif system == 'Linux' and meta['linux']:
                 result = read_status_linux(option)
@@ -1634,7 +1641,7 @@ def cmd_status_query(args) -> int:
     results: dict[str, dict] = {}
     errors:  dict[str, str]  = {}
 
-    if system == 'Darwin' and _uvc_probe_available():
+    if system in ('Darwin', 'Linux') and _uvc_probe_available():
         for opt, m in STATUS_OPTIONS.items():
             if not m['usb']: continue
             try:    results[opt] = read_status_usb(opt)
@@ -2543,7 +2550,7 @@ def main():
     if _status_arg == 'status' and cmd in STATUS_OPTIONS:
         meta = STATUS_OPTIONS[cmd]
         try:
-            if system == 'Darwin' and meta['usb'] and _uvc_probe_available():
+            if (system in ('Darwin', 'Linux')) and meta['usb'] and _uvc_probe_available():
                 result = read_status_usb(cmd)
             elif system == 'Linux' and meta['linux']:
                 result = read_status_linux(cmd)
@@ -2631,15 +2638,15 @@ def main():
             _warn(f'✗ USB preset {cmd} failed: {e}')
             sys.exit(3)
 
-    # ── Platform-specific AI mode restriction ─────────────────────────────────
+    # ── Platform-specific AI mode restriction (WS-only fallback) ─────────────
     AI_CMDS = {'track', 'deskview', 'whiteboard', 'overhead', 'normal'}
-    if system == 'Linux' and cmd in AI_CMDS:
-        _warn("✗ AI modes require Insta360 Link Controller (macOS/Windows only).")
+    if system == 'Linux' and cmd in AI_CMDS and not _uvc_probe_available():
+        _warn("✗ AI modes require USB-direct backend or Insta360 Link Controller.")
         sys.exit(4)
 
-    # ── Linux PTZ via v4l2-ctl ────────────────────────────────────────────────
+    # ── Linux PTZ via v4l2-ctl (fallback when USB-direct unavailable) ────────
     PTZ_CMDS = {'pan', 'tilt', 'pan-rel', 'tilt-rel', 'zoom', 'zoom-rel', 'center'}
-    if system == 'Linux' and cmd in PTZ_CMDS:
+    if system == 'Linux' and cmd in PTZ_CMDS and not _uvc_probe_available():
         linux_ptz_dispatch(args)
         return
 

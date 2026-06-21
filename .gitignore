@@ -20,6 +20,7 @@ xu_capture_report_*.capture.json
 
 # Compiled binaries (rebuild from source)
 tools/uvc-probe
+tools/uvc-probe-linux
 tools/uvc-probe.unsigned
 tools/usb-suspend
 tools/usb-suspend.unsigned
@@ -37,3 +38,4 @@ mobileui-screenshots/
 
 # macOS
 .DS_Store
+tools/uvc-probe-linux

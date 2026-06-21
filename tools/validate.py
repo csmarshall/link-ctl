@@ -50,6 +50,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import platform
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -64,6 +66,8 @@ from link_ctl import (
     build_value_change, build_zoom,
     build_preset_recall, build_preset_save, build_preset_delete,
     _lsof_port, _read_token_from_ini,
+    read_status_usb, write_ai_mode, write_zoom, read_zoom,
+    read_pantilt, _uvc_probe_available,
 )
 
 
@@ -388,6 +392,52 @@ def make_tests() -> list[TestCase]:
     ]
 
 
+def run_usb_test(name: str, apply, check, restore=None) -> Result:
+    _log(name)
+    try:
+        apply()
+        time.sleep(1.0)
+        passed, msg = check()
+        if restore:
+            restore()
+            time.sleep(0.5)
+        return Result(name, passed, msg)
+    except Exception as e:
+        return Result(name, False, str(e))
+
+
+def run_usb_all(only: list[str]) -> int:
+    import link_ctl as lc
+
+    if not _uvc_probe_available():
+        print('✗ USB-direct backend unavailable.', file=sys.stderr)
+        return 2
+
+    specs = [
+        ('zoom', lambda: lc.write_zoom(200),
+         lambda: (lc.read_zoom() == 200, f'zoom={lc.read_zoom()}'),
+         lambda: lc.write_zoom(100)),
+        ('track', lambda: lc.write_ai_mode('track'),
+         lambda: (lc.read_status_usb('track')['is_on'], lc.read_status_usb('track')['display']),
+         lambda: lc.write_ai_mode('normal')),
+        ('autoexposure', lambda: lc._uvc_set(9, 0x1e, bytes([1])),
+         lambda: (not lc.read_status_usb('autoexposure')['is_on'], lc.read_status_usb('autoexposure')['display']),
+         lambda: lc._uvc_set(9, 0x1e, bytes([2]))),
+    ]
+    if only:
+        specs = [s for s in specs if s[0] in only]
+
+    results = []
+    for name, apply, check, restore in specs:
+        print(f'[TEST] {name}')
+        r = run_usb_test(name, apply, check, restore)
+        print(f'  [{"PASS" if r.passed else "FAIL"}] {r.message}')
+        results.append(r)
+    failed = sum(1 for r in results if not r.passed)
+    print(f'Results: {len(results)-failed}/{len(results)} passed')
+    return 0 if failed == 0 else 1
+
+
 # ── Main runner ───────────────────────────────────────────────────────────────
 
 async def run_all(port: int, token: str, only: list[str]) -> int:
@@ -468,6 +518,8 @@ def main():
     p.add_argument('url', nargs='?',
                    help='QR code URL (http://link-controller.insta360.com/v3/link/?...)')
     p.add_argument('--port', type=int, help='WebSocket port override')
+    p.add_argument('--backend', choices=('ws', 'usb'), default='ws',
+                   help='Validation backend: ws (Link Controller) or usb (Linux USB-direct)')
     p.add_argument('--only', metavar='NAME[,NAME...]',
                    help='Comma-separated list of tests to run (default: all)')
     p.add_argument('--list', action='store_true', help='List all test names and exit')
@@ -503,6 +555,10 @@ def main():
         token = _read_token_from_ini() or ''
 
     only = [n.strip() for n in args.only.split(',')] if args.only else []
+
+    if args.backend == 'usb':
+        sys.exit(run_usb_all(only))
+
     sys.exit(asyncio.run(run_all(port, token, only)))
 
 
