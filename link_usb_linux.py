@@ -40,36 +40,84 @@ def _probe_xu_set(unit: int, sel: int, data: bytes) -> bool:
         capture_output=True, text=True, timeout=10)
     if r.returncode != 0:
         return False
-    _rebind_uvcvideo()
+    try:
+        _wait_for_video_device(timeout=8.0)
+    except RuntimeError:
+        pass
     return True
 
 
-def _rebind_uvcvideo() -> None:
-    """Re-attach uvcvideo after a transient --detach probe operation."""
-    bind = Path('/sys/bus/usb/drivers/uvcvideo/bind')
-    if not bind.is_file():
-        return
-    sysfs = Path('/sys/bus/usb/devices')
-    for entry in sysfs.iterdir():
-        name = entry.name
-        if ':1.0' not in name and ':1.1' not in name:
-            continue
-        dev = name.split(':')[0]
-        vid = sysfs / dev / 'idVendor'
-        if not vid.exists() or vid.read_text().strip() != f'{INSTA360_VID:04x}':
-            continue
-        try:
-            bind.write_text(name + '\n')
-        except OSError:
+def _bootstrap_uvcvideo() -> bool:
+    """Attach uvcvideo via libusb when capture nodes are missing (post-detach)."""
+    ctx = LibusbContext()
+    if _libusb.libusb_init(byref(ctx)) != 0:
+        return False
+    attached = False
+    list_pp = POINTER(c_void_p)()
+    desc = _DeviceDescriptor()
+    cnt = -1
+    try:
+        cnt = _libusb.libusb_get_device_list(ctx, byref(list_pp))
+        if cnt < 0:
+            return False
+        for i in range(cnt):
+            dev = list_pp[i]
+            if not dev:
+                continue
+            if _libusb.libusb_get_device_descriptor(dev, byref(desc)) != 0:
+                continue
+            if desc.idVendor != INSTA360_VID or desc.idProduct not in SUPPORTED_PIDS:
+                continue
+            handle = LibusbDeviceHandle()
+            if _libusb.libusb_open(dev, byref(handle)) != 0:
+                continue
+            try:
+                # Broken partial bind (If0=uvcvideo, If1=none, no /dev/video): cycle both.
+                if _find_video_device() is None:
+                    for iface in (VC_IFACE_NUM, 1):
+                        if _libusb.libusb_kernel_driver_active(handle, iface) == 1:
+                            _libusb.libusb_detach_kernel_driver(handle, iface)
+                for iface in (VC_IFACE_NUM, 1):
+                    if _libusb.libusb_kernel_driver_active(handle, iface) == 0:
+                        if _libusb.libusb_attach_kernel_driver(handle, iface) == 0:
+                            attached = True
+            finally:
+                _libusb.libusb_close(handle)
+            break
+    finally:
+        if cnt >= 0:
+            _libusb.libusb_free_device_list(list_pp, 1)
+        _libusb.libusb_exit(ctx)
+    return attached
+
+
+def _rebind_uvcvideo(*, unbind_first: bool = False) -> None:
+    """Re-attach uvcvideo via sysfs bind (requires root; no-op when permission denied)."""
+    for ok, _detail in _rebind_uvcvideo_sysfs(unbind_first=unbind_first):
+        if not ok:
             pass
 
 
-def _wait_for_video_device(timeout: float = 6.0) -> str:
+def _libusb_reattach_vc(handle: 'LinuxUSBHandle | None') -> None:
+    """Re-bind uvcvideo through libusb after a transient CT/PU detach."""
+    if handle is None or not handle._libusb_ok or not handle.dev:
+        return
+    for iface in (VC_IFACE_NUM, 1):
+        if _libusb.libusb_kernel_driver_active(handle.dev, iface) == 0:
+            _libusb.libusb_attach_kernel_driver(handle.dev, iface)
+
+
+def _wait_for_video_device(timeout: float = 12.0,
+                           handle: 'LinuxUSBHandle | None' = None) -> str:
     """Block until an Insta360 capture node is openable (post-detach recovery)."""
     import time
+    global _video_dev_cache
+    _video_dev_cache = None
     deadline = time.monotonic() + timeout
     last_err = 'device not found'
     while time.monotonic() < deadline:
+        _bootstrap_uvcvideo()
+        _libusb_reattach_vc(handle)
         _rebind_uvcvideo()
         dev = _find_video_device()
         if dev and os.path.exists(dev):
@@ -79,21 +127,242 @@ def _wait_for_video_device(timeout: float = 6.0) -> str:
                 return dev
             except OSError as e:
                 last_err = str(e)
-        time.sleep(0.25)
+        time.sleep(0.3)
     raise RuntimeError(f'No Insta360 /dev/video device found ({last_err})')
+
+
+def _after_ct_detach(handle: 'LinuxUSBHandle | None' = None) -> None:
+    """Re-bind uvcvideo and reopen ioctl after CT/PU libusb detach."""
+    global _video_dev_cache, _handle
+    _video_dev_cache = None
+
+    if handle is not None and handle._libusb_ok and handle.dev:
+        for iface in (VC_IFACE_NUM, 1):
+            if _libusb.libusb_kernel_driver_active(handle.dev, iface) == 0:
+                _libusb.libusb_attach_kernel_driver(handle.dev, iface)
+
+    try:
+        path = _wait_for_video_device(handle=handle, timeout=6.0)
+    except RuntimeError:
+        # An open libusb handle with a detached iface blocks bootstrap; drop it.
+        if handle is not None:
+            handle._ioctl.close()
+            if handle._libusb_ok and handle.dev:
+                for iface in (VC_IFACE_NUM, 1):
+                    if _libusb.libusb_kernel_driver_active(handle.dev, iface) == 0:
+                        _libusb.libusb_attach_kernel_driver(handle.dev, iface)
+                _libusb.libusb_close(handle.dev)
+                handle.dev = LibusbDeviceHandle()
+                handle._libusb_ok = False
+        if _handle is handle:
+            _handle = None
+        _bootstrap_uvcvideo()
+        path = _wait_for_video_device(timeout=10.0)
+
+    if handle is not None:
+        if handle._ioctl._fd is not None:
+            try:
+                handle._ioctl.close()
+            except Exception:
+                pass
+        handle._ioctl.open()
+    try:
+        import link_ctl
+        link_ctl.reset_usb_caches()
+    except Exception:
+        pass
+    if handle is not None and handle._ioctl._fd is None:
+        raise RuntimeError(f'No Insta360 /dev/video device found (reopen failed for {path})')
 
 
 def recover() -> None:
     """Rebind uvcvideo and reset cached handles after a CT/PU detach cycle."""
+    global _handle
+    h = _handle
+    try:
+        _after_ct_detach(h)
+    except RuntimeError:
+        _bootstrap_uvcvideo()
+        _wait_for_video_device()
+        _invalidate_handle()
+    try:
+        import link_ctl
+        link_ctl.reset_usb_caches()
+    except Exception:
+        pass
+
+
+def _video_device_ready() -> str | None:
+    """Return openable Insta360 /dev/video path, or None."""
+    global _video_dev_cache
+    dev = _find_video_device()
+    if dev and os.path.exists(dev):
+        try:
+            fd = os.open(dev, os.O_RDWR)
+            os.close(fd)
+            return dev
+        except OSError:
+            _video_dev_cache = None
+    return None
+
+
+def _reset_handle_reopen() -> tuple[bool, str]:
+    """Close cached USB/ioctl handles and reopen."""
     global _video_dev_cache
     _video_dev_cache = None
-    _wait_for_video_device()
+    _invalidate_handle()
+    try:
+        h = _get_handle()
+        mask = h.get(9, 0x1B, 2)
+        return True, f'handle reopened (func_enable={mask.hex()})'
+    except Exception as e:
+        _invalidate_handle()
+        return False, str(e)
+
+
+def _reset_libusb_device() -> tuple[bool, str]:
+    """USB bus reset via libusb — only the discovered Insta360 device."""
+    _invalidate_handle()
+    ctx = LibusbContext()
+    if _libusb.libusb_init(byref(ctx)) != 0:
+        return False, 'libusb_init failed'
+    desc = _DeviceDescriptor()
+    list_pp = POINTER(c_void_p)()
+    cnt = _libusb.libusb_get_device_list(ctx, byref(list_pp))
+    if cnt < 0:
+        _libusb.libusb_exit(ctx)
+        return False, 'libusb_get_device_list failed'
+    target_dev = None
+    try:
+        for i in range(cnt):
+            dev = list_pp[i]
+            if not dev:
+                continue
+            if _libusb.libusb_get_device_descriptor(dev, byref(desc)) != 0:
+                continue
+            if desc.idVendor != INSTA360_VID or desc.idProduct not in SUPPORTED_PIDS:
+                continue
+            target_dev = dev
+            break
+    finally:
+        _libusb.libusb_free_device_list(list_pp, 1)
+    if target_dev is None:
+        _libusb.libusb_exit(ctx)
+        return False, 'Insta360 device not found on USB bus'
+    handle = LibusbDeviceHandle()
+    if _libusb.libusb_open(target_dev, byref(handle)) != 0:
+        _libusb.libusb_exit(ctx)
+        return False, 'libusb_open failed (udev rule installed?)'
+    try:
+        _libusb.libusb_reset_device.argtypes = [LibusbDeviceHandle]
+        _libusb.libusb_reset_device.restype = c_int
+        rc = _libusb.libusb_reset_device(handle)
+        if rc != 0:
+            err = _libusb.libusb_strerror(rc)
+            msg = err.decode() if err else f'error {rc}'
+            return False, f'libusb_reset_device: {msg}'
+        return True, 'libusb_reset_device ok'
+    finally:
+        _libusb.libusb_close(handle)
+        _libusb.libusb_exit(ctx)
+
+
+def reset_device(*, verbose: bool = False, skip_usb_reset: bool = False) -> dict:
+    """Recover a hung Insta360 Link after detach/crash without unplugging.
+
+    Tries in order: handle reopen → libusb reset → uvcvideo unbind/rebind →
+    wait for /dev/video*. Safe: only touches Insta360 VID/PID from sysfs scan.
+    """
+    import time
+
+    global _video_dev_cache
+    log: list[str] = []
+    methods: list[str] = []
+
+    def _say(msg: str) -> None:
+        log.append(msg)
+        if verbose:
+            print(msg)
+
+    devices = discover_insta360_devices()
+    if not devices:
+        raise RuntimeError(
+            'No Insta360 Link device found on USB (expected 2e1a:4c01/4c02/4c03/4c04)')
+    dev = devices[0]
+    if len(devices) > 1 and verbose:
+        _say(f'warning: multiple Insta360 devices; using {dev["bus_path"]}')
+    _say(f'found {dev["product"] or "Insta360 Link"} at {dev["bus_path"]} '
+         f'({INSTA360_VID:04x}:{dev["product_id"]:04x})')
+
+    ready = _video_device_ready()
+    if ready:
+        _say(f'video device already ready: {ready}')
+        _invalidate_handle()
+        try:
+            import link_ctl
+            link_ctl.reset_usb_caches()
+        except Exception:
+            pass
+        return {'ok': True, 'video': ready, 'methods': ['already_ready'], 'log': log}
+
+    ok, detail = _reset_handle_reopen()
+    methods.append('handle_reopen')
+    _say(f'handle reopen: {"ok" if ok else "failed"} — {detail}')
+    ready = _video_device_ready()
+    if ready:
+        _say(f'video device ready: {ready}')
+        try:
+            import link_ctl
+            link_ctl.reset_usb_caches()
+        except Exception:
+            pass
+        return {'ok': True, 'video': ready, 'methods': methods, 'log': log}
+
+    if not skip_usb_reset:
+        ok, detail = _reset_libusb_device()
+        methods.append('libusb_reset')
+        _say(f'libusb reset: {"ok" if ok else "failed"} — {detail}')
+        if ok:
+            time.sleep(1.0)
+        ready = _video_device_ready()
+        if ready:
+            _say(f'video device ready: {ready}')
+            try:
+                import link_ctl
+                link_ctl.reset_usb_caches()
+            except Exception:
+                pass
+            return {'ok': True, 'video': ready, 'methods': methods, 'log': log}
+
+    sysfs_results = _rebind_uvcvideo_sysfs(unbind_first=True)
+    methods.append('uvcvideo_rebind')
+    for ok, detail in sysfs_results:
+        _say(f'sysfs: {"ok" if ok else "failed"} — {detail}')
+    if sysfs_results and not any(r[0] for r in sysfs_results):
+        need_sudo = any('permission denied' in r[1] for r in sysfs_results)
+        if need_sudo:
+            script = Path(__file__).resolve().parent / 'tools' / 'reset_link2.sh'
+            ifaces = '; '.join(
+                f'echo {i} > /sys/bus/usb/drivers/uvcvideo/bind'
+                for i in _insta360_uvc_interfaces())
+            raise RuntimeError(
+                'sysfs uvcvideo bind requires root. Run:\n'
+                f'  sudo {script}\n'
+                f'Or manually:\n  sudo sh -c \'{ifaces}\'')
+
+    _video_dev_cache = None
+    try:
+        video = _wait_for_video_device()
+    except RuntimeError as e:
+        raise RuntimeError(f'recovery failed: {e}') from e
     _invalidate_handle()
     try:
         import link_ctl
         link_ctl.reset_usb_caches()
     except Exception:
         pass
+    _say(f'video device ready: {video}')
+    return {'ok': True, 'video': video, 'methods': methods, 'log': log}
 
 
 def xu_get_len(unit: int, sel: int) -> int:
@@ -182,6 +451,99 @@ _libusb.libusb_strerror.restype = ctypes.c_char_p
 
 SUPPORTED_PIDS = (0x4C01, 0x4C04, 0x4C02, 0x4C03)
 VC_IFACE_NUM = 0
+# UVC streaming/control interfaces (not audio :1.2/:1.3).
+_UVC_IFACE_SUFFIXES = (':1.0', ':1.1')
+
+
+def discover_insta360_devices(
+    *,
+    vid: int = INSTA360_VID,
+    pids: tuple[int, ...] = SUPPORTED_PIDS,
+) -> list[dict]:
+    """Return attached Insta360 Link devices discovered via sysfs.
+
+    Each entry: bus_path, product_id, product, interfaces[{sysfs, bound, driver}].
+    Only matches known Insta360 vendor/product IDs.
+    """
+    sysfs = Path('/sys/bus/usb/devices')
+    if not sysfs.is_dir():
+        return []
+    results: list[dict] = []
+    for entry in sorted(sysfs.iterdir(), key=lambda p: p.name):
+        name = entry.name
+        if ':' in name:
+            continue
+        vid_path = entry / 'idVendor'
+        pid_path = entry / 'idProduct'
+        if not vid_path.is_file() or not pid_path.is_file():
+            continue
+        try:
+            if vid_path.read_text().strip() != f'{vid:04x}':
+                continue
+            pid = int(pid_path.read_text().strip(), 16)
+            if pid not in pids:
+                continue
+        except (OSError, ValueError):
+            continue
+        product_path = entry / 'product'
+        product = product_path.read_text().strip() if product_path.is_file() else ''
+        interfaces: list[dict] = []
+        for suffix in _UVC_IFACE_SUFFIXES:
+            iface = f'{name}{suffix}'
+            iface_path = sysfs / iface
+            if not iface_path.is_dir():
+                continue
+            driver_link = iface_path / 'driver'
+            bound = driver_link.is_symlink()
+            driver = driver_link.resolve().name if bound else None
+            interfaces.append({
+                'sysfs': iface,
+                'bound': bound,
+                'driver': driver,
+            })
+        results.append({
+            'bus_path': name,
+            'product_id': pid,
+            'product': product,
+            'interfaces': interfaces,
+        })
+    return results
+
+
+def _insta360_uvc_interfaces() -> list[str]:
+    """Sysfs names (e.g. 1-10.4.3.1:1.0) for Insta360 UVC interfaces."""
+    names: list[str] = []
+    for dev in discover_insta360_devices():
+        for iface in dev['interfaces']:
+            names.append(iface['sysfs'])
+    return names
+
+
+def _sysfs_driver_op(driver: str, op: str, iface: str) -> tuple[bool, str]:
+    """Write iface name to /sys/bus/usb/drivers/<driver>/<op>. Returns (ok, detail)."""
+    path = Path(f'/sys/bus/usb/drivers/{driver}/{op}')
+    if not path.is_file():
+        return False, f'{path} missing'
+    if not os.access(path, os.W_OK):
+        return False, f'permission denied writing {path} (try sudo)'
+    try:
+        path.write_text(iface + '\n')
+        return True, f'{op} {iface}'
+    except OSError as e:
+        return False, f'{op} {iface}: {e}'
+
+
+def _rebind_uvcvideo_sysfs(*, unbind_first: bool = False) -> list[tuple[bool, str]]:
+    """Bind Insta360 UVC interfaces to uvcvideo; optionally unbind first."""
+    results: list[tuple[bool, str]] = []
+    for iface in _insta360_uvc_interfaces():
+        if unbind_first:
+            driver_link = Path('/sys/bus/usb/devices') / iface / 'driver'
+            if driver_link.is_symlink() and driver_link.resolve().name == 'uvcvideo':
+                results.append(_sysfs_driver_op('uvcvideo', 'unbind', iface))
+        results.append(_sysfs_driver_op('uvcvideo', 'bind', iface))
+    return results
+
 UVC_GET_CUR = 0x81
 UVC_SET_CUR = 0x01
 UVC_GET_LEN = 0x85
@@ -258,9 +620,9 @@ def _probe_ct_pu(op: str, unit: int, sel: int, *,
         return b''
     finally:
         try:
-            recover()
+            _wait_for_video_device(timeout=8.0)
         except RuntimeError:
-            _invalidate_handle()
+            pass
 
 
 def _v4l2_get_ctrl(name: str) -> int:
@@ -431,7 +793,13 @@ class _IoctlBackend:
     def open(self) -> None:
         path = _find_video_device()
         if not path:
-            path = _wait_for_video_device()
+            try:
+                _wait_for_video_device(timeout=8.0)
+                path = _find_video_device()
+            except RuntimeError:
+                pass
+        if not path:
+            raise RuntimeError('No Insta360 /dev/video device found (device not found)')
         self._fd = os.open(path, os.O_RDWR)
 
     def close(self) -> None:
@@ -567,11 +935,11 @@ class LinuxUSBHandle:
             return b'' if r >= 0 else None
         finally:
             if detached:
-                _libusb.libusb_attach_kernel_driver(self.dev, VC_IFACE_NUM)
                 try:
-                    recover()
+                    _after_ct_detach(self)
                 except RuntimeError:
                     _invalidate_handle()
+                    raise
 
     def _pu_get(self, sel: int, length: int) -> bytes:
         """Processing Unit — v4l2 only (never detach; libusb breaks PU on Link 2)."""
@@ -618,13 +986,18 @@ class LinuxUSBHandle:
             if _v4l2_set(1, sel, data):
                 return
             raise RuntimeError(f'CT SET failed s=0x{sel:02x}')
-        if self._libusb_xfer(1, sel, data, 0) is not None:
-            return
-        if _v4l2_set(1, sel, data):
+        # Pan/tilt: subprocess probe owns detach/attach lifecycle (avoids stale in-process handle).
+        if _probe_ct_pu('set', 1, sel, data=data) is not None:
+            try:
+                _after_ct_detach(None)
+            except RuntimeError:
+                _invalidate_handle()
+                raise
+            _invalidate_handle()
             return
         if self._libusb_xfer(1, sel, data, 0, force_detach=True) is not None:
             return
-        if _probe_ct_pu('set', 1, sel, data=data) is not None:
+        if _v4l2_set(1, sel, data):
             return
         raise RuntimeError(f'CT SET failed s=0x{sel:02x}')
 

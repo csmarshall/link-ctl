@@ -427,17 +427,17 @@ def run_usb_all(only: list[str]) -> int:
     ctx: dict = {}
 
     def _center_apply() -> None:
+        try:
+            import link_usb_linux as ul
+            ul.recover()
+        except Exception:
+            pass
         lc.write_ai_mode('normal')
         ctx['zoom'] = lc.read_zoom()
         lc.write_zoom(100)
         lc.write_pantilt(0, 0)
         time.sleep(1.0)
         lc.write_pantilt(0, 0)
-        try:
-            import link_usb_linux as ul
-            ul.recover()
-        except Exception:
-            pass
 
     def _check_center() -> tuple[bool, str]:
         for attempt in range(12):

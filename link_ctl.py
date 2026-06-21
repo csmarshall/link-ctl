@@ -2629,6 +2629,8 @@ def build_parser() -> argparse.ArgumentParser:
                                   (no option = dump everything readable)
   discover [--verbose]            find WebSocket port and cache it
   preflight                       run all checks (process, USB, port, handshake)
+  reset [--verbose]               recover hung Link after USB detach (Linux)
+  recover                         alias for reset (Linux only)
 
 toggle commands: omit the argument to smart-toggle based on current state.
 status: bool options exit 0 if on / 1 if off; enums and scalars exit 0 and
@@ -2717,6 +2719,14 @@ print the current value to stdout. Equivalent forms:
                    help='emit machine-readable JSON')
     s = sub.add_parser('discover');  s.add_argument('--verbose', action='store_true')
     sub.add_parser('preflight')
+    s = sub.add_parser('reset', help='recover hung Link after USB detach (Linux)')
+    s.add_argument('--verbose', action='store_true',
+                   help='print each recovery step')
+    s.add_argument('--skip-usb-reset', action='store_true',
+                   help='skip libusb_reset_device (sysfs rebind only)')
+    s = sub.add_parser('recover', help='alias for reset (Linux only)')
+    s.add_argument('--verbose', action='store_true')
+    s.add_argument('--skip-usb-reset', action='store_true')
 
     return p
 
@@ -2748,6 +2758,27 @@ def main():
 
     if cmd == 'preflight':
         asyncio.run(cmd_preflight_check(debug=debug, port_override=args.port))
+        return
+
+    if cmd in ('reset', 'recover'):
+        if system != 'Linux':
+            _warn('✗ reset/recover is only available on Linux.')
+            sys.exit(4)
+        if _usb_backend is None:
+            _warn('✗ link_usb_linux backend unavailable.')
+            sys.exit(4)
+        verbose = getattr(args, 'verbose', False) or _VERBOSITY >= 2
+        try:
+            result = _usb_backend.reset_device(
+                verbose=verbose,
+                skip_usb_reset=getattr(args, 'skip_usb_reset', False),
+            )
+        except RuntimeError as e:
+            _warn(f'✗ reset failed: {e}')
+            sys.exit(3)
+        if not args.silent:
+            _info(f"✓ Link recovered — {result['video']} "
+                  f"(methods: {', '.join(result['methods'])})")
         return
 
     if cmd == 'status':

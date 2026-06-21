@@ -51,10 +51,37 @@ streamdeck/privacy_on.sh
 - Zoom read via CT sel `0x0B`: `6400` hex = 100 decimal
 - After `--detach` tests, rebind `uvcvideo` if `/dev/video0` disappears:
   ```bash
+  link-ctl reset              # preferred — auto-discovers bus path, tries handle/libusb/sysfs
+  sudo tools/reset_link2.sh   # when sysfs bind needs root (typical)
+  streamdeck/reset.sh         # OpenDeck / hotkey wrapper
+  ```
+  Manual sysfs rebind (bus path varies — discover with `lsusb -t` or sysfs):
+  ```bash
+  # Example only; use link-ctl reset to auto-discover 1-10.4.3.1:1.0 etc.
   sudo sh -c 'echo 1-10.4.3.1:1.0 > /sys/bus/usb/drivers/uvcvideo/bind'
   sudo sh -c 'echo 1-10.4.3.1:1.1 > /sys/bus/usb/drivers/uvcvideo/bind'
   ```
   Or unplug/replug the camera.
+
+### USB recovery (`reset` / `recover`)
+
+When libusb detach tests leave the Link hung (USB visible in `lsusb` but no `/dev/video*`):
+
+| Step | Method | Sudo? | When it helps |
+|------|--------|-------|---------------|
+| 1 | Close/reopen USB handle | No | Stale handle after soft detach |
+| 2 | `libusb_reset_device` | No* | USB protocol reset (*udev `99-insta360-link.rules`) |
+| 3 | `uvcvideo` unbind/rebind via sysfs | **Yes** | Interfaces detached, no video node |
+| 4 | Wait for `/dev/video*` | No | Confirms recovery |
+
+```bash
+link-ctl reset --verbose
+link-ctl recover              # alias
+python3 -m link_usb_linux     # smoke test after reset
+```
+
+Discovery scans `/sys/bus/usb/devices` for `idVendor=2e1a` and known PIDs only — never resets unrelated USB devices.
+
 
 ### AI mode wire format (XU9 sel 0x02, 61 bytes on Link 2)
 
