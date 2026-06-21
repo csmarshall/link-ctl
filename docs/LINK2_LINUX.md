@@ -9,7 +9,8 @@ Device: **Insta360 Link 2** (`2e1a:4c04`)
 | `link_usb_linux.py` | Hybrid ioctl (XU 9/10/11) + libusb/v4l2 (CT/PU) |
 | `tools/uvc-probe-linux` | libusb probe; `--detach` for CT/PU |
 | `link_ctl.py` Linux dispatch | USB-direct first; v4l2 fallback |
-| `tools/validate.py --backend usb` | Basic round-trip tests |
+| `tools/validate.py --backend usb` | 8/8 round-trip tests on Link 2 |
+| `streamdeck/*.sh` | Linux Stream Deck scripts (USB-direct) |
 | `tools/99-insta360-link.rules` | udev permissions for libusb |
 
 ## Link 2 vs OG Link (`4c01`) findings
@@ -23,6 +24,18 @@ Device: **Insta360 Link 2** (`2e1a:4c04`)
 | 0x1A | 8 | Pan/tilt readback on OG Link (**stale on Link 2** — use v4l2) |
 | 0x1B | 2 | Func-enable bitmask (`f50b` sample) |
 | 0x1E | 1 | AE mode: `2`=auto, `1`=manual |
+
+### XU unit 10 (Link 2 privacy)
+
+| Sel | Len | Notes |
+|-----|-----|-------|
+| 0x0F | 2 | Privacy mode: `0x0002`=on, `0x0000`=off (+ func-enable bit 11) |
+
+```bash
+python3 link_ctl.py privacy on
+python3 link_ctl.py status privacy
+streamdeck/privacy_on.sh
+```
 
 ### Broken on stock Linux driver
 
@@ -44,7 +57,7 @@ Device: **Insta360 Link 2** (`2e1a:4c04`)
 
 ### Open questions
 
-- [ ] XU2 unit 10 privacy selector map (Link 2/2 Pro gimbal-down)
+- [ ] AI mode readback for deskview/whiteboard/overhead on Link 2 (byte0 often `0xFF` like track)
 - [ ] Smart composition master switch (bit 0 of `0x1B` — unconfirmed)
 - [ ] Full `snapshot` inventory diff vs OG Link
 

@@ -596,12 +596,27 @@ AI_MODE_BYTES = {
 }
 
 _ai_mode_len_cache: int | None = None
+_privacy_len_cache: int | None = None
+
+def reset_usb_caches() -> None:
+    """Clear runtime USB probe caches (call after driver rebind)."""
+    global _ai_mode_len_cache, _privacy_len_cache
+    _ai_mode_len_cache = None
+    _privacy_len_cache = None
 
 def _ai_mode_len() -> int:
     """Return the firmware-reported AI mode buffer length (52 OG, 61 Link 2)."""
     global _ai_mode_len_cache
     if _ai_mode_len_cache is not None:
         return _ai_mode_len_cache
+    if platform.system() == 'Linux' and _usb_backend is not None:
+        try:
+            ln = _usb_backend.xu_get_len(9, AI_MODE_SEL)
+            if ln > 0:
+                _ai_mode_len_cache = ln
+                return ln
+        except Exception:
+            pass
     try:
         from link_usb import LinuxXUBackend
         b = LinuxXUBackend(); b.open()
@@ -648,6 +663,54 @@ def read_ai_mode() -> str:
     if mid == 0xFF and _ai_mode_len() >= 61:
         return 'track'
     return f'unknown(0x{mid:02x}/0x{flag:02x})'
+
+# Link 2 / 2 Pro privacy (XU2 unit 10). OG Link ignores these writes.
+PRIVACY_UNIT = 10
+PRIVACY_SEL  = 0x0F
+BIT_PRIVACY  = 11
+# Observed Link 2 steady-state GET @ 10/0x0F (len=2): 0x0002 when active.
+PRIVACY_ON_WIRE  = 2
+PRIVACY_OFF_WIRE = 0
+
+def _privacy_len() -> int:
+    global _privacy_len_cache
+    if _privacy_len_cache is not None:
+        return _privacy_len_cache
+    if platform.system() == 'Linux' and _usb_backend is not None:
+        try:
+            ln = _usb_backend.xu_get_len(PRIVACY_UNIT, PRIVACY_SEL)
+            if ln > 0:
+                _privacy_len_cache = ln
+                return ln
+        except Exception:
+            pass
+    _privacy_len_cache = 2
+    return 2
+
+def _link2_privacy_available() -> bool:
+    if platform.system() != 'Linux' or _usb_backend is None:
+        return False
+    try:
+        return _usb_backend.privacy_supported()
+    except Exception:
+        return False
+
+def _privacy_wire(on: bool) -> bytes:
+    val = PRIVACY_ON_WIRE if on else PRIVACY_OFF_WIRE
+    ln = _privacy_len()
+    if ln == 1:
+        return bytes([min(val, 255)])
+    return struct.pack('<H', val)
+
+def read_privacy() -> bool:
+    raw = _uvc_get(PRIVACY_UNIT, PRIVACY_SEL, _privacy_len())
+    if len(raw) >= 2:
+        return struct.unpack('<H', raw[:2])[0] != 0
+    return raw[0] != 0
+
+def write_privacy(on: bool) -> None:
+    _uvc_set(PRIVACY_UNIT, PRIVACY_SEL, _privacy_wire(on))
+    _bitmask_set_bit(BIT_PRIVACY, on)
 
 # Smart framing (composition style) at unit 9 sel 0x13 (19), 1 byte.
 FRAMING_SEL = 0x13
@@ -715,6 +778,7 @@ STATUS_OPTIONS: dict[str, dict] = {
     'autofocus':        {'kind': 'bool',    'usb': True,  'ws': False, 'linux': True},
     'smartcomposition': {'kind': 'bool',    'usb': False, 'ws': True,  'linux': False},
     'noise-cancel':     {'kind': 'bool',    'usb': True,  'ws': False, 'linux': False},
+    'privacy':          {'kind': 'bool',    'usb': True,  'ws': False, 'linux': False},
     'smartcomp-frame':  {'kind': 'enum',    'usb': True,  'ws': False, 'linux': False},
     'anti-flicker':     {'kind': 'enum',    'usb': True,  'ws': False, 'linux': True},
     'track-speed':      {'kind': 'scalar',  'usb': True,  'ws': True,  'linux': False},
@@ -772,6 +836,10 @@ def read_status_usb(option: str) -> dict:
         v = _uvc_get(1, 0x08, 1) == bytes([1]); return _status_result(option, v, is_on=v)
     if option == 'noise-cancel':
         v = _uvc_get(9, NOISE_CANCEL_SEL, 1) == bytes([1]); return _status_result(option, v, is_on=v)
+    if option == 'privacy':
+        if not _link2_privacy_available():
+            raise KeyError('privacy requires Link 2 / 2 Pro USB')
+        v = read_privacy(); return _status_result(option, v, is_on=v)
 
     if option == 'anti-flicker':
         raw = _uvc_get(5, 0x05, 1)[0]
@@ -1020,6 +1088,16 @@ def usb_image_dispatch(args) -> None:
                 target = 'off' if cur else 'on'
             _uvc_set(9, NOISE_CANCEL_SEL, bytes([1 if target == 'on' else 0]))
             _info(f"noise-cancel: {'on' if cur else 'off'} → {target}")
+
+        elif cmd == 'privacy':
+            if not _link2_privacy_available():
+                raise RuntimeError('privacy is only supported on Link 2 / 2 Pro via USB')
+            target = args.state
+            cur = read_privacy()
+            if target in (None, 'toggle'):
+                target = 'off' if cur else 'on'
+            write_privacy(target == 'on')
+            _info(f"privacy: {'on' if cur else 'off'} → {target}")
 
         # ── Manual ISO (u9 sel 0x19, 2B LE uint16; AE-off gated) ─────────────
         elif cmd == 'iso':
@@ -2427,6 +2505,7 @@ def build_parser() -> argparse.ArgumentParser:
   normal                                return to standard mode
   track-speed  <0-255>                  AI tracking speed (default 2; OG Link semantics TBD)
   noise-cancel [on|off|toggle|status]   microphone noise cancellation (USB-direct only)
+  privacy      [on|off|toggle|status]   gimbal-down privacy (Link 2 / 2 Pro USB only)
 
   ── Image settings  (USB-direct on macOS; WS elsewhere) ────────────
   hdr              [on|off|toggle|status]   HDR
@@ -2537,6 +2616,7 @@ print the current value to stdout. Equivalent forms:
     s = sub.add_parser('wb-temp');       s.add_argument('value', type=int, help='White balance temperature 2800..10000 K (AWB must be off)')
     s = sub.add_parser('track-speed');   s.add_argument('value', type=int, help='AI tracking speed 0..255 (default 2; effective semantics on OG Link TBD)')
     s = sub.add_parser('noise-cancel');  s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
+    s = sub.add_parser('privacy');       s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
     s = sub.add_parser('iso');           s.add_argument('value', type=int, help='Manual ISO 0..65535 (autoexposure must be off)')
     s = sub.add_parser('shutter');       s.add_argument('value', type=int, help='Manual shutter (autoexposure must be off; units appear to be µs — 1000 = 1 ms)')
     s = sub.add_parser('gesture-zoom');  s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
@@ -2639,7 +2719,7 @@ def main():
                     'anti-flicker', 'autofocus',
                     'track', 'deskview', 'whiteboard', 'overhead', 'normal',
                     'smartcomp-frame', 'track-speed',
-                    'noise-cancel', 'iso', 'shutter'}
+                    'noise-cancel', 'privacy', 'iso', 'shutter'}
     if cmd in USB_IMG_CMDS and _uvc_probe_available():
         usb_image_dispatch(args)
         return

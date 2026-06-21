@@ -89,6 +89,48 @@ def recover() -> None:
     _video_dev_cache = None
     _wait_for_video_device()
     _invalidate_handle()
+    try:
+        import link_ctl
+        link_ctl.reset_usb_caches()
+    except Exception:
+        pass
+
+
+def xu_get_len(unit: int, sel: int) -> int:
+    return _get_handle()._ioctl.get_len(unit, sel)
+
+
+def device_product_id() -> int | None:
+    """Return USB product ID for the open Insta360 device, if known."""
+    h = _get_handle()
+    if not h._libusb_ok:
+        return None
+    desc = _DeviceDescriptor()
+    # libusb doesn't expose get_device from handle easily; scan sysfs instead.
+    sysfs = Path('/sys/bus/usb/devices')
+    for entry in sysfs.iterdir():
+        pid = entry / 'idProduct'
+        vid = entry / 'idVendor'
+        if not pid.exists() or not vid.exists():
+            continue
+        try:
+            if vid.read_text().strip() != f'{INSTA360_VID:04x}':
+                continue
+            return int(pid.read_text().strip(), 16)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def is_link2() -> bool:
+    pid = device_product_id()
+    return pid in (0x4C04, 0x4C02, 0x4C03)
+
+
+def privacy_supported() -> bool:
+    """Gimbal-down privacy (XU10) — Link 2 / 2 Pro, not OG Link or 2C shutter models."""
+    pid = device_product_id()
+    return pid in (0x4C04, 0x4C03)
 
 
 def _invalidate_handle() -> None:
@@ -142,6 +184,7 @@ SUPPORTED_PIDS = (0x4C01, 0x4C04, 0x4C02, 0x4C03)
 VC_IFACE_NUM = 0
 UVC_GET_CUR = 0x81
 UVC_SET_CUR = 0x01
+UVC_GET_LEN = 0x85
 
 XU_UNITS = frozenset({9, 10, 11})
 
@@ -409,6 +452,20 @@ class _IoctlBackend:
         q.data = ctypes.addressof(data_buf)
         fcntl.ioctl(self._fd, self._ioctl_num, q)
         return bytes(data_buf)
+
+    def get_len(self, unit: int, sel: int) -> int:
+        import fcntl
+        if self._fd is None:
+            raise RuntimeError('ioctl backend not open')
+        data_buf = (ctypes.c_uint8 * 2)()
+        q = _UvcXuControlQuery()
+        q.unit = unit
+        q.selector = sel
+        q.query = UVC_GET_LEN
+        q.size = 2
+        q.data = ctypes.addressof(data_buf)
+        fcntl.ioctl(self._fd, self._ioctl_num, q)
+        return int.from_bytes(bytes(data_buf), 'little')
 
     def set(self, unit: int, sel: int, data: bytes) -> None:
         import fcntl
