@@ -16,6 +16,7 @@ Usage:
   sudo python3 tools/xu_verify.py --read-only
 """
 import argparse
+import os
 import platform
 import subprocess
 import sys
@@ -40,7 +41,9 @@ def sep(label):
 
 def _probe_cmd(unit: int, op: str, *args: str) -> list[str]:
     cmd = [PROBE_BIN]
-    if platform.system() == 'Linux' and unit not in (9, 10, 11):
+    detach = os.environ.get('LINK_CTL_USB_DETACH', '').lower() in ('1', 'true', 'yes')
+    no_detach = os.environ.get('LINK_CTL_NO_DETACH', '').lower() in ('1', 'true', 'yes')
+    if platform.system() == 'Linux' and unit not in (9, 10, 11) and detach and not no_detach:
         cmd.append('--detach')
     cmd.append(op)
     cmd.extend(args)

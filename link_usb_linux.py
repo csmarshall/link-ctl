@@ -24,6 +24,18 @@ from pathlib import Path
 
 _PROBE = Path(__file__).resolve().parent / 'tools' / 'uvc-probe-linux'
 
+
+def _detach_allowed() -> bool:
+    """True when kernel driver detach is explicitly opted in (PTZ/center only).
+
+    Default is False — detach/rebind cycles hang the Link 2 when run in loops.
+    Set LINK_CTL_USB_DETACH=1 or pass ``link-ctl --detach`` for pan/tilt SET.
+    """
+    if os.environ.get('LINK_CTL_NO_DETACH', '').lower() in ('1', 'true', 'yes'):
+        return False
+    return os.environ.get('LINK_CTL_USB_DETACH', '').lower() in ('1', 'true', 'yes')
+
+
 if platform.system() != 'Linux':
     raise ImportError('link_usb_linux requires Linux')
 
@@ -31,12 +43,16 @@ INSTA360_VID = 0x2E1A
 
 
 def _probe_xu_set(unit: int, sel: int, data: bytes) -> bool:
-    """Last-resort XU SET via uvc-probe-linux --detach; rebinds uvcvideo after."""
+    """Last-resort XU SET via uvc-probe-linux; detach only when explicitly allowed."""
     import subprocess
     if not _PROBE.is_file():
         return False
+    cmd = [str(_PROBE)]
+    if _detach_allowed():
+        cmd.append('--detach')
+    cmd.extend(['set', str(unit), f'0x{sel:02x}', data.hex()])
     r = subprocess.run(
-        [str(_PROBE), '--detach', 'set', str(unit), f'0x{sel:02x}', data.hex()],
+        cmd,
         capture_output=True, text=True, timeout=10)
     if r.returncode != 0:
         return False
@@ -602,11 +618,14 @@ def _v4l2_set_awb_auto(value: int) -> None:
 
 def _probe_ct_pu(op: str, unit: int, sel: int, *,
                  length: int | None = None, data: bytes | None = None) -> bytes | None:
-    """Run uvc-probe-linux with transient kernel detach for CT/PU access."""
+    """Run uvc-probe-linux for CT/PU access; detach only when explicitly allowed."""
     import subprocess
     if not _PROBE.is_file():
         return None
-    cmd = [str(_PROBE), '--detach', op, str(unit), f'0x{sel:02x}']
+    cmd = [str(_PROBE)]
+    if _detach_allowed():
+        cmd.insert(1, '--detach')
+    cmd.extend([op, str(unit), f'0x{sel:02x}'])
     if op == 'get':
         cmd.append(str(length))
     else:
@@ -995,10 +1014,14 @@ class LinuxUSBHandle:
                 raise
             _invalidate_handle()
             return
-        if self._libusb_xfer(1, sel, data, 0, force_detach=True) is not None:
-            return
+        if _detach_allowed():
+            if self._libusb_xfer(1, sel, data, 0, force_detach=True) is not None:
+                return
         if _v4l2_set(1, sel, data):
             return
+        if not _detach_allowed():
+            raise RuntimeError(
+                f'CT SET failed s=0x{sel:02x} (pan/tilt needs --detach or LINK_CTL_USB_DETACH=1)')
         raise RuntimeError(f'CT SET failed s=0x{sel:02x}')
 
     def _usb_get(self, unit: int, sel: int, length: int) -> bytes:

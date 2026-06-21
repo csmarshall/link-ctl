@@ -2645,6 +2645,8 @@ print the current value to stdout. Equivalent forms:
     p.add_argument('-s', '--silent',  action='store_true', help='Suppress all output including errors')
     p.add_argument('--port',     type=int,                  help='Override WebSocket port discovery')
     p.add_argument('--skip-preflight', action='store_true', help='Skip preflight checks')
+    p.add_argument('--detach', action='store_true',
+                   help='Allow kernel driver detach for PTZ pan/tilt (risky; default is ioctl-only)')
 
     sub = p.add_subparsers(dest='command', required=True)
 
@@ -2737,6 +2739,13 @@ def main():
     debug  = args.debug
     system = platform.system()
     cmd    = args.command
+
+    # Safe default: never detach uvcvideo unless --detach or LINK_CTL_USB_DETACH=1.
+    if getattr(args, 'detach', False):
+        os.environ['LINK_CTL_USB_DETACH'] = '1'
+        os.environ.pop('LINK_CTL_NO_DETACH', None)
+    elif os.environ.get('LINK_CTL_USB_DETACH', '').lower() not in ('1', 'true', 'yes'):
+        os.environ['LINK_CTL_NO_DETACH'] = '1'
 
     # Set verbosity (silent < quiet < verbose < debug)
     if args.silent:

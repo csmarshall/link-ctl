@@ -108,11 +108,67 @@ SET (vrwallace / link-ctl `write_ai_mode`):
 - [ ] Smart composition master switch (bit 0 of `0x1B` — unconfirmed)
 - [ ] Full `snapshot` inventory diff vs OG Link
 
-Probe AI modes (camera must be plugged in):
+Probe AI modes (camera must be plugged in; ioctl-only, no detach):
 
 ```bash
-python3 tools/probe_ai_modes.py
+python3 tools/probe_ai_modes.py          # recover() between modes, 3s settle
+LINK_CTL_PROBE_SETTLE=4 python3 tools/probe_ai_modes.py
 ```
+
+## Safe testing (avoid camera hangs)
+
+Repeated **kernel driver detach** (`uvc-probe-linux --detach`, pan/tilt center, CT SET)
+and rapid **AI mode XU writes** without recovery leave the Link 2 hung (USB visible,
+no `/dev/video*`). Default `link-ctl` behavior is **ioctl-only** — detach is opt-in.
+
+### What hangs the camera
+
+| Action | Risk |
+|--------|------|
+| `validate.py --backend usb` **center** test | CT pan/tilt SET → detach/rebind cycle |
+| `uvc-probe-linux --detach` in loops | Drops uvcvideo; stale handles |
+| Rapid `write_ai_mode` / mode probes | Firmware stuck in `0xFF` transition |
+| `xu_verify.py` on CT/PU without recovery | Same as detach probes |
+
+### Safe defaults (after this branch)
+
+- `link-ctl` sets `LINK_CTL_NO_DETACH=1` unless you pass **`--detach`**
+- AI modes (track, deskview, overhead, mirror, …) use **XU ioctl only** — no detach
+- `center` / pan/tilt SET needs `--detach` or `LINK_CTL_USB_DETACH=1` on Link 2
+
+### Recommended test order
+
+Run **one** smoke pass, then use the camera normally. Do not loop destructive tests.
+
+```bash
+# 1. Confirm device is up (ioctl only)
+python3 link_ctl.py status mode
+
+# 2. Safe USB validation — skip center unless you need PTZ reset
+LINK_CTL_SKIP_CENTER=1 python3 tools/validate.py --backend usb \
+  --only zoom,track,mirror,hdr,brightness
+
+# 3. Optional: single mode check (not a loop)
+python3 link_ctl.py deskview on
+sleep 3
+python3 link_ctl.py normal
+
+# 4. Center only when needed (requires detach on Link 2)
+link-ctl --detach center
+link-ctl recover
+
+# 5. If hung after experiments
+link-ctl recover --verbose
+```
+
+### Environment variables
+
+| Variable | Effect |
+|----------|--------|
+| `LINK_CTL_SKIP_CENTER=1` | Skip center test in `validate.py --backend usb` |
+| `LINK_CTL_NO_DETACH=1` | Never detach uvcvideo (default via `link-ctl`) |
+| `LINK_CTL_USB_DETACH=1` | Allow detach for pan/tilt (legacy opt-in) |
+| `LINK_CTL_PROBE_SETTLE` | Seconds after mode SET in `probe_ai_modes.py` (default 3) |
 
 ## Quick test
 
@@ -121,8 +177,8 @@ make -C tools uvc-probe-linux
 python3 link_usb_linux.py
 python3 link_ctl.py status autoexposure
 python3 link_ctl.py track on
-python3 tools/validate.py --backend usb --only zoom,track,center,autoexposure,awb,hdr,mirror,brightness
-./tools/uvc-probe-linux snapshot   # libusb; use xu_snapshot_linux.py while streaming
+# Safe smoke (no center / no detach):
+LINK_CTL_SKIP_CENTER=1 python3 tools/validate.py --backend usb --only zoom,track,mirror
 python3 tools/xu_snapshot_linux.py # ioctl snapshot (preferred on Linux)
 ```
 
