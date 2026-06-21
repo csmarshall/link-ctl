@@ -488,6 +488,12 @@ def run_usb_all(only: list[str], skip_center: bool = False) -> int:
         ('track', lambda: lc.write_ai_mode('track'),
          lambda: (lc.read_status_usb('track')['is_on'], lc.read_status_usb('track')['display']),
          lambda: (lc.write_ai_mode('normal'), time.sleep(1.5)), True),
+        ('overhead', lambda: lc.write_ai_mode('overhead'),
+         lambda: (lc.read_status_usb('overhead')['is_on'], lc.read_status_usb('overhead')['display']),
+         lambda: (lc.write_ai_mode('normal'), time.sleep(1.5)), True),
+        ('deskview', lambda: lc.write_ai_mode('deskview'),
+         lambda: (lc.read_status_usb('deskview')['is_on'], lc.read_status_usb('deskview')['display']),
+         lambda: (lc.write_ai_mode('normal'), time.sleep(1.5)), True),
         ('autoexposure', lambda: lc._uvc_set(9, 0x1e, bytes([1])),
          lambda: (not lc.read_status_usb('autoexposure')['is_on'], lc.read_status_usb('autoexposure')['display']),
          lambda: lc._uvc_set(9, 0x1e, bytes([2])), False),
@@ -513,7 +519,7 @@ def run_usb_all(only: list[str], skip_center: bool = False) -> int:
     if only:
         specs = [s for s in specs if s[0] in only]
 
-    settle_map = {'center': 5.0, 'track': 2.5}
+    settle_map = {'center': 5.0, 'track': 2.5, 'overhead': 2.5, 'deskview': 2.5}
 
     results = []
     for name, apply, check, restore, recover_after in specs:

@@ -4,26 +4,31 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VID="2e1a"
-PIDS="4c01 4c02 4c03 4c04"
+if [[ -x /usr/bin/python3 ]]; then
+  PY=/usr/bin/python3
+else
+  PY="$(command -v python3 || true)"
+fi
+if [[ -z "$PY" ]]; then
+  echo "reset_link2: python3 not found" >&2
+  exit 127
+fi
 
-need_sudo=0
+RESET_ARGS=(reset --verbose --force --skip-usb-reset "$@")
+
+# Always try user-level recovery first (handle reopen + libusb reset; no sysfs).
+if "$PY" "$ROOT/link_ctl.py" "${RESET_ARGS[@]}"; then
+  exit 0
+fi
+
+# sysfs bind requires root — use non-interactive sudo when available.
 if [[ ! -w /sys/bus/usb/drivers/uvcvideo/bind ]]; then
-  need_sudo=1
-fi
-
-run() {
-  if [[ "$need_sudo" -eq 1 ]]; then
-    sudo "$@"
-  else
-    "$@"
+  if sudo -n "$PY" "$ROOT/link_ctl.py" "${RESET_ARGS[@]}" 2>/dev/null; then
+    exit 0
   fi
-}
-
-# Prefer link_ctl reset (handle reopen → libusb reset → sysfs rebind).
-if [[ "$need_sudo" -eq 0 ]]; then
-  exec python3 "$ROOT/link_ctl.py" reset --verbose "$@"
+  echo "reset: USB recovery failed; sysfs bind needs passwordless sudo." >&2
+  echo "  Run: sudo $0" >&2
+  exit 1
 fi
 
-echo "sysfs bind requires root; running recovery with sudo..." >&2
-exec sudo python3 "$ROOT/link_ctl.py" reset --verbose "$@"
+exec "$PY" "$ROOT/link_ctl.py" "${RESET_ARGS[@]}"

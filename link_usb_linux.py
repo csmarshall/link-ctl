@@ -283,11 +283,16 @@ def _reset_libusb_device() -> tuple[bool, str]:
         _libusb.libusb_exit(ctx)
 
 
-def reset_device(*, verbose: bool = False, skip_usb_reset: bool = False) -> dict:
+def reset_device(*, verbose: bool = False, skip_usb_reset: bool = False,
+                 force: bool = False) -> dict:
     """Recover a hung Insta360 Link after detach/crash without unplugging.
 
     Tries in order: handle reopen → libusb reset → uvcvideo unbind/rebind →
     wait for /dev/video*. Safe: only touches Insta360 VID/PID from sysfs scan.
+
+    When *force* is True, run handle reopen (and libusb reset unless skipped)
+    even if /dev/video* is already present — useful when the node exists but
+    XU/ioctl state is stale (Stream Deck reset button).
     """
     import time
 
@@ -311,7 +316,7 @@ def reset_device(*, verbose: bool = False, skip_usb_reset: bool = False) -> dict
          f'({INSTA360_VID:04x}:{dev["product_id"]:04x})')
 
     ready = _video_device_ready()
-    if ready:
+    if ready and not force:
         _say(f'video device already ready: {ready}')
         _invalidate_handle()
         try:
@@ -320,6 +325,27 @@ def reset_device(*, verbose: bool = False, skip_usb_reset: bool = False) -> dict
         except Exception:
             pass
         return {'ok': True, 'video': ready, 'methods': ['already_ready'], 'log': log}
+    if ready and force:
+        _say(f'video device ready: {ready} (force recovery)')
+        _invalidate_handle()
+        try:
+            import link_ctl
+            link_ctl.reset_usb_caches()
+        except Exception:
+            pass
+        ok, detail = _reset_handle_reopen()
+        methods.append('handle_reopen')
+        _say(f'handle reopen: {"ok" if ok else "failed"} — {detail}')
+        # libusb_reset_device on Link 2 can leave AI mode stuck at 0xFF/0x10 (track)
+        # with XU SET no-ops — only use when the video node is missing.
+        if not skip_usb_reset and not ready:
+            ok, detail = _reset_libusb_device()
+            methods.append('libusb_reset')
+            _say(f'libusb reset: {"ok" if ok else "failed"} — {detail}')
+            if ok:
+                time.sleep(1.0)
+        ready = _video_device_ready() or ready
+        return {'ok': True, 'video': ready, 'methods': methods, 'log': log}
 
     ok, detail = _reset_handle_reopen()
     methods.append('handle_reopen')

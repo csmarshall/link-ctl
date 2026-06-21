@@ -706,24 +706,59 @@ def _ai_mode_wire_id() -> int | None:
             pass
     return mid
 
+def _ai_mode_wire_ok(mode_name: str, mid: int | None) -> bool:
+    """Return True when byte[0] readback matches the requested steady-state mode."""
+    if mid is None:
+        return False
+    mode_id, _ = AI_MODE_BYTES[mode_name]
+    if mode_name == 'normal':
+        return mid == 0x00
+    if mode_name == 'track':
+        return mid in (0x01, 0xFF)
+    return mid == mode_id
+
+def _link2_track_stuck() -> bool:
+    """True when Link 2 reports steady AI tracking (0xFF/0x10) on GET."""
+    if not _link2():
+        return False
+    try:
+        raw = _ai_mode_get_raw()
+    except OSError:
+        return False
+    return len(raw) >= 2 and raw[0] == 0xFF and raw[1] == 0x10
+
+def _link2_exit_track_for_mode(target: str) -> None:
+    """Best-effort exit from AI tracking before another mode SET."""
+    if target == 'track' or not _link2_track_stuck():
+        return
+    for _ in range(4):
+        _apply_ai_mode_buffer(0, 0)
+        time.sleep(2.0)
+        if not _link2_track_stuck():
+            return
+    raise RuntimeError(
+        'Link 2 is stuck in AI tracking (0xFF/0x10); USB mode SET has no effect. '
+        'Unplug/replug the camera once. Avoid libusb reset recovery while /dev/video '
+        'exists — it can leave this state.')
+
 def write_ai_mode(mode_name: str) -> None:
     """Set AI video mode via XU9 sel 0x02.
 
     OG Link: zero-fill 52-byte buffer. Link 2 (61-byte): zero-fill bytes 0..51,
     preserve tail 52+, exit to normal and disable privacy before a new mode
     (matches vrwallace SetCameraMode sequencing).
+
+    Always sends SET (no early return when readback already matches) so Stream
+    Deck / hotkey scripts re-trigger the firmware even after a partial apply.
     """
     global _last_ai_mode_written, _last_ai_mode_ts
     mode_id, flag = AI_MODE_BYTES[mode_name]
     ln = _ai_mode_len()
 
     if _link2() and ln >= 61:
+        if mode_name != 'track':
+            _link2_exit_track_for_mode(mode_name)
         mid = _ai_mode_wire_id()
-        if mode_name == 'normal':
-            if mid == 0x00:
-                return
-        elif mid == mode_id:
-            return
         if mode_name != 'normal':
             if read_privacy():
                 write_privacy(False)
@@ -740,6 +775,22 @@ def write_ai_mode(mode_name: str) -> None:
     _last_ai_mode_written = mode_name
     _last_ai_mode_ts = time.monotonic()
     time.sleep(1.5)  # firmware reports 0xFF during transition (API.md)
+    # Link 2 ioctl SET can appear to succeed while byte[0] does not stick; verify/retry.
+    if _link2() and ln >= 61:
+        retries = 6 if mode_name == 'normal' else 3
+        pause = 1.5 if mode_name == 'normal' else 1.0
+        for attempt in range(retries):
+            if _ai_mode_wire_ok(mode_name, _ai_mode_wire_id()):
+                return
+            if attempt < retries - 1:
+                _apply_ai_mode_buffer(mode_id, flag)
+                time.sleep(pause)
+        got = _ai_mode_wire_id()
+        if not _ai_mode_wire_ok(mode_name, got):
+            raise RuntimeError(
+                f'AI mode SET did not stick: wanted {mode_name}, '
+                f'wire byte[0]=0x{got:02x} (expected '
+                f'{hex(mode_id) if mode_name != "normal" else "0x00"})')
 
 def read_ai_mode() -> str:
     """Read the current video mode."""
@@ -1217,9 +1268,6 @@ def usb_image_dispatch(args) -> None:
             if state in (None, 'toggle'):
                 state = 'off' if cur == target_mode else 'on'
             new_mode = target_mode if state == 'on' else 'normal'
-            if state == 'on' and cur == target_mode:
-                _info(f"{cmd}: already {target_mode}")
-                return
             write_ai_mode(new_mode)
             _info(f"{cmd}: {cur} → {new_mode}")
 
@@ -2789,10 +2837,13 @@ print the current value to stdout. Equivalent forms:
     s = sub.add_parser('reset', help='recover hung Link after USB detach (Linux)')
     s.add_argument('--verbose', action='store_true',
                    help='print each recovery step')
+    s.add_argument('--force', action='store_true',
+                   help='recover even when /dev/video* exists (reopen + libusb reset)')
     s.add_argument('--skip-usb-reset', action='store_true',
                    help='skip libusb_reset_device (sysfs rebind only)')
     s = sub.add_parser('recover', help='alias for reset (Linux only)')
     s.add_argument('--verbose', action='store_true')
+    s.add_argument('--force', action='store_true')
     s.add_argument('--skip-usb-reset', action='store_true')
 
     return p
@@ -2846,6 +2897,7 @@ def main():
             result = _usb_backend.reset_device(
                 verbose=verbose,
                 skip_usb_reset=getattr(args, 'skip_usb_reset', False),
+                force=getattr(args, 'force', False),
             )
         except RuntimeError as e:
             _warn(f'✗ reset failed: {e}')
