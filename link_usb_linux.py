@@ -64,6 +64,33 @@ def _rebind_uvcvideo() -> None:
             pass
 
 
+def _wait_for_video_device(timeout: float = 6.0) -> str:
+    """Block until an Insta360 capture node is openable (post-detach recovery)."""
+    import time
+    deadline = time.monotonic() + timeout
+    last_err = 'device not found'
+    while time.monotonic() < deadline:
+        _rebind_uvcvideo()
+        dev = _find_video_device()
+        if dev and os.path.exists(dev):
+            try:
+                fd = os.open(dev, os.O_RDWR)
+                os.close(fd)
+                return dev
+            except OSError as e:
+                last_err = str(e)
+        time.sleep(0.25)
+    raise RuntimeError(f'No Insta360 /dev/video device found ({last_err})')
+
+
+def recover() -> None:
+    """Rebind uvcvideo and reset cached handles after a CT/PU detach cycle."""
+    global _video_dev_cache
+    _video_dev_cache = None
+    _wait_for_video_device()
+    _invalidate_handle()
+
+
 def _invalidate_handle() -> None:
     global _handle
     if _handle is not None:
@@ -137,8 +164,35 @@ _V4L2_SET_MAP: dict[tuple[int, int], str] = {
     (5, 0x07): 'saturation',
     (5, 0x08): 'sharpness',
     (5, 0x0A): 'white_balance_temperature',
-    (5, 0x0B): 'white_balance_temperature_auto',
 }
+
+
+# Link 2 exposes white_balance_automatic; OG Link / other kernels use
+# white_balance_temperature_auto.
+_WB_AUTO_CTRLS = (
+    'white_balance_automatic',
+    'white_balance_temperature_auto',
+    'auto_white_balance',
+)
+
+
+def _v4l2_get_awb_auto() -> int:
+    for name in _WB_AUTO_CTRLS:
+        try:
+            return _v4l2_get_ctrl(name)
+        except RuntimeError:
+            continue
+    raise RuntimeError('no AWB auto v4l2 control found')
+
+
+def _v4l2_set_awb_auto(value: int) -> None:
+    for name in _WB_AUTO_CTRLS:
+        try:
+            _v4l2_set_ctrl(name, value)
+            return
+        except RuntimeError:
+            continue
+    raise RuntimeError('no AWB auto v4l2 control found')
 
 
 def _probe_ct_pu(op: str, unit: int, sel: int, *,
@@ -152,13 +206,18 @@ def _probe_ct_pu(op: str, unit: int, sel: int, *,
         cmd.append(str(length))
     else:
         cmd.append(data.hex() if data else '')
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-    if r.returncode != 0:
-        return None
-    if op == 'get':
-        return bytes.fromhex(r.stdout.strip())
-    return b''
-    return _find_video_device() or '/dev/video0'
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return None
+        if op == 'get':
+            return bytes.fromhex(r.stdout.strip())
+        return b''
+    finally:
+        try:
+            recover()
+        except RuntimeError:
+            _invalidate_handle()
 
 
 def _v4l2_get_ctrl(name: str) -> int:
@@ -194,7 +253,7 @@ def _v4l2_get(unit: int, sel: int, length: int) -> bytes | None:
             val = _v4l2_get_ctrl('focus_auto')
         return bytes([1 if val else 0])
     if unit == 5 and sel == 0x0B and length == 1:
-        auto = _v4l2_get_ctrl('white_balance_temperature_auto')
+        auto = _v4l2_get_awb_auto()
         return bytes([1 if auto else 0])
     if unit == 5 and sel == 0x05 and length == 1:
         plf = _v4l2_get_ctrl('power_line_frequency')
@@ -206,17 +265,23 @@ def _v4l2_get(unit: int, sel: int, length: int) -> bytes | None:
 def _v4l2_set(unit: int, sel: int, data: bytes) -> bool:
     if unit == 1 and sel == 0x0D and len(data) == 8:
         pan, tilt = struct.unpack('<ii', data)
-        _v4l2_set_ctrl('pan_absolute', pan)
-        _v4l2_set_ctrl('tilt_absolute', tilt)
-        return True
+        try:
+            _v4l2_set_ctrl('pan_absolute', pan)
+            _v4l2_set_ctrl('tilt_absolute', tilt)
+            return True
+        except RuntimeError:
+            return False
     name = _V4L2_SET_MAP.get((unit, sel))
     if not name:
         return False
     if len(data) == 1:
-        val = data[0]
         if (unit, sel) == (5, 0x0B):
-            val = 1 if data[0] else 0
-        _v4l2_set_ctrl(name, val)
+            try:
+                _v4l2_set_awb_auto(1 if data[0] else 0)
+                return True
+            except RuntimeError:
+                return False
+        _v4l2_set_ctrl(name, data[0])
         return True
     if len(data) == 2:
         val = struct.unpack('<H', data)[0]
@@ -267,13 +332,33 @@ class _UvcXuControlQuery(ctypes.Structure):
     ]
 
 
+def read_pantilt_v4l2() -> tuple[int, int]:
+    """Read pan/tilt via v4l2 — reliable on Link 2 (XU 0x1A readback is stale)."""
+    return _v4l2_get_ctrl('pan_absolute'), _v4l2_get_ctrl('tilt_absolute')
+
+
 def _video_device() -> str:
-    return _find_video_device() or '/dev/video0'
+    dev = _find_video_device()
+    if dev:
+        return dev
+    return '/dev/video0'
+
+
+_video_dev_cache: str | None = None
 
 
 def _find_video_device() -> str | None:
+    global _video_dev_cache
+    if _video_dev_cache and os.path.exists(_video_dev_cache):
+        try:
+            fd = os.open(_video_dev_cache, os.O_RDWR)
+            os.close(fd)
+            return _video_dev_cache
+        except OSError:
+            _video_dev_cache = None
     env_device = os.environ.get('LINK_CTL_V4L2_DEVICE')
     if env_device and os.path.exists(env_device):
+        _video_dev_cache = env_device
         return env_device
     sysfs = Path('/sys/class/video4linux')
     if sysfs.is_dir():
@@ -285,10 +370,14 @@ def _find_video_device() -> str | None:
                 if 'insta360' in name_file.read_text().strip().lower():
                     dev = f'/dev/{entry.name}'
                     if os.path.exists(dev):
+                        _video_dev_cache = dev
                         return dev
             except OSError:
                 continue
-    return '/dev/video0' if os.path.exists('/dev/video0') else None
+    if os.path.exists('/dev/video0'):
+        _video_dev_cache = '/dev/video0'
+        return '/dev/video0'
+    return None
 
 
 class _IoctlBackend:
@@ -297,10 +386,9 @@ class _IoctlBackend:
         self._ioctl_num = _linux_ioctl_number()
 
     def open(self) -> None:
-        import fcntl
         path = _find_video_device()
         if not path:
-            raise RuntimeError('No Insta360 /dev/video device found')
+            path = _wait_for_video_device()
         self._fd = os.open(path, os.O_RDWR)
 
     def close(self) -> None:
@@ -395,47 +483,119 @@ class LinuxUSBHandle:
             _libusb.libusb_exit(self.ctx)
             self.ctx = LibusbContext()
 
-    def _usb_get(self, unit: int, sel: int, length: int) -> bytes:
-        if self._libusb_ok:
-            buf = (c_uint8 * length)()
-            r = _libusb.libusb_control_transfer(
-                self.dev, 0xA1, UVC_GET_CUR,
-                sel << 8, (unit << 8) | VC_IFACE_NUM,
-                buf, length, 1000)
-            if r >= 0:
-                return bytes(buf[:r])
-        fb = _v4l2_get(unit, sel, length)
-        if fb is not None:
-            return fb
-        if unit == 1 and sel == 0x0D and length == 8:
-            return self._ioctl.get(9, 0x1A, 8)
-        probed = _probe_ct_pu('get', unit, sel, length=length)
-        if probed is not None:
-            return probed
-        raise RuntimeError(f'GET_CUR failed u={unit} s=0x{sel:02x}')
-
-    def _usb_set(self, unit: int, sel: int, data: bytes) -> None:
-        if self._libusb_ok:
+    def _libusb_xfer(self, unit: int, sel: int, data: bytes | None, length: int,
+                     *, force_detach: bool = False) -> bytes | None:
+        """CT/PU GET (data=None) or SET. Returns GET bytes, b'' on SET success, None on failure."""
+        if not self._libusb_ok:
+            return None
+        detached = False
+        try:
+            if force_detach and _libusb.libusb_kernel_driver_active(self.dev, VC_IFACE_NUM) == 1:
+                if _libusb.libusb_detach_kernel_driver(self.dev, VC_IFACE_NUM) == 0:
+                    detached = True
+            if data is None:
+                buf = (c_uint8 * length)()
+                r = _libusb.libusb_control_transfer(
+                    self.dev, 0xA1, UVC_GET_CUR,
+                    sel << 8, (unit << 8) | VC_IFACE_NUM,
+                    buf, length, 1000)
+                if r >= 0:
+                    return bytes(buf[:r])
+                return None
             buf = (c_uint8 * len(data))(*data)
             r = _libusb.libusb_control_transfer(
                 self.dev, 0x21, UVC_SET_CUR,
                 sel << 8, (unit << 8) | VC_IFACE_NUM,
                 buf, len(data), 1000)
-            if r >= 0:
+            return b'' if r >= 0 else None
+        finally:
+            if detached:
+                _libusb.libusb_attach_kernel_driver(self.dev, VC_IFACE_NUM)
+                try:
+                    recover()
+                except RuntimeError:
+                    _invalidate_handle()
+
+    def _pu_get(self, sel: int, length: int) -> bytes:
+        """Processing Unit — v4l2 only (never detach; libusb breaks PU on Link 2)."""
+        fb = _v4l2_get(5, sel, length)
+        if fb is not None:
+            return fb
+        raise RuntimeError(f'PU GET failed s=0x{sel:02x} via v4l2')
+
+    def _pu_set(self, sel: int, data: bytes) -> None:
+        if _v4l2_set(5, sel, data):
+            return
+        # v4l2 SET can fail for AWB while GET works; libusb (no detach) is safe for PU.
+        if self._libusb_xfer(5, sel, data, 0) is not None:
+            return
+        raise RuntimeError(f'PU SET failed s=0x{sel:02x}')
+
+    def _ct_get(self, sel: int, length: int) -> bytes:
+        """Camera Terminal GET — v4l2, then XU pan readback; no detach."""
+        try:
+            fb = _v4l2_get(1, sel, length)
+            if fb is not None:
+                return fb
+        except RuntimeError:
+            pass
+        if sel == 0x0D and length == 8:
+            try:
+                pan, tilt = read_pantilt_v4l2()
+                return struct.pack('<ii', pan, tilt)
+            except RuntimeError:
+                pass
+            if self._ioctl._fd is None:
+                self._ioctl.open()
+            return self._ioctl.get(9, 0x1A, 8)
+        got = self._libusb_xfer(1, sel, None, length)
+        if got is not None:
+            return got
+        raise RuntimeError(f'CT GET failed s=0x{sel:02x}')
+
+    def _ct_set(self, sel: int, data: bytes) -> None:
+        """Camera Terminal SET — pan/tilt may need detach; zoom uses v4l2."""
+        if sel != 0x0D:
+            if self._libusb_xfer(1, sel, data, 0) is not None:
                 return
-        if _v4l2_set(unit, sel, data):
+            if _v4l2_set(1, sel, data):
+                return
+            raise RuntimeError(f'CT SET failed s=0x{sel:02x}')
+        if self._libusb_xfer(1, sel, data, 0) is not None:
             return
-        if _probe_ct_pu('set', unit, sel, data=data) is not None:
+        if _v4l2_set(1, sel, data):
             return
+        if self._libusb_xfer(1, sel, data, 0, force_detach=True) is not None:
+            return
+        if _probe_ct_pu('set', 1, sel, data=data) is not None:
+            return
+        raise RuntimeError(f'CT SET failed s=0x{sel:02x}')
+
+    def _usb_get(self, unit: int, sel: int, length: int) -> bytes:
+        if unit == 5:
+            return self._pu_get(sel, length)
+        if unit == 1:
+            return self._ct_get(sel, length)
+        raise RuntimeError(f'GET_CUR failed u={unit} s=0x{sel:02x}')
+
+    def _usb_set(self, unit: int, sel: int, data: bytes) -> None:
+        if unit == 5:
+            return self._pu_set(sel, data)
+        if unit == 1:
+            return self._ct_set(sel, data)
         raise RuntimeError(f'SET_CUR failed u={unit} s=0x{sel:02x}')
 
     def get(self, unit: int, sel: int, length: int) -> bytes:
         if unit in XU_UNITS:
+            if self._ioctl._fd is None:
+                self._ioctl.open()
             return self._ioctl.get(unit, sel, length)
         return self._usb_get(unit, sel, length)
 
     def set(self, unit: int, sel: int, data: bytes) -> None:
         if unit in XU_UNITS:
+            if self._ioctl._fd is None:
+                self._ioctl.open()
             # ioctl SET works for Link 2 XU (use RMW payloads from link_ctl).
             # In-process libusb SET fails with EIO while uvcvideo is bound.
             try:
@@ -457,9 +617,10 @@ def _get_handle() -> LinuxUSBHandle:
     global _handle
     if _handle is None:
         _handle = LinuxUSBHandle()
-    else:
+        return _handle
+    if _handle._ioctl._fd is None:
         try:
-            _handle._ioctl.get(9, 0x1E, 1)
+            _handle._ioctl.open()
         except Exception:
             _handle.close()
             _handle = LinuxUSBHandle()

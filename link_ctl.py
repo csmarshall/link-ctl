@@ -435,7 +435,7 @@ def _uvc_get(unit: int, sel: int, length: int) -> bytes:
         try:
             return _usb_backend.get(unit, sel, length)
         except Exception:
-            if unit in (9, 10, 11):
+            if unit in (9, 10, 11) or platform.system() == 'Linux':
                 raise
     r = subprocess.run(
         [str(UVC_PROBE), 'get', str(unit), f'0x{sel:02x}', str(length)],
@@ -449,7 +449,7 @@ def _uvc_set(unit: int, sel: int, data: bytes) -> None:
         try:
             _usb_backend.set(unit, sel, data); return
         except Exception:
-            if unit in (9, 10, 11):
+            if unit in (9, 10, 11) or platform.system() == 'Linux':
                 raise
     r = subprocess.run(
         [str(UVC_PROBE), 'set', str(unit), f'0x{sel:02x}', data.hex()],
@@ -458,8 +458,16 @@ def _uvc_set(unit: int, sel: int, data: bytes) -> None:
         raise RuntimeError(f'uvc-probe set u={unit} s=0x{sel:02x} failed: {r.stderr.strip()}')
 
 def read_pantilt() -> tuple[int, int]:
-    """Return current (pan, tilt). Reads XU1 sel 0x1a which returns the pair
-    in reversed (tilt, pan) order — we swap so callers always see (pan, tilt)."""
+    """Return current (pan, tilt).
+
+    Linux Link 2: v4l2 readback is reliable; XU1 sel 0x1a tilt word is stale.
+    macOS / fallback: XU readback (tilt, pan) LE, swapped to (pan, tilt).
+    """
+    if platform.system() == 'Linux' and _usb_backend is not None:
+        try:
+            return _usb_backend.read_pantilt_v4l2()
+        except Exception:
+            pass
     raw = _uvc_get(XU_PANTILT_READ_UNIT, XU_PANTILT_READ_SEL, 8)
     t, p = struct.unpack('<ii', raw)
     return p, t
@@ -865,8 +873,14 @@ def read_status_linux(option: str) -> dict:
         v = int(_get('auto_exposure')) != 1
         return _status_result(option, v, is_on=v)
     if option == 'awb':
-        v = int(_get('white_balance_temperature_auto')) == 1
-        return _status_result(option, v, is_on=v)
+        for ctrl in ('white_balance_automatic', 'white_balance_temperature_auto',
+                     'auto_white_balance'):
+            try:
+                v = int(_get(ctrl)) == 1
+                return _status_result(option, v, is_on=v)
+            except Exception:
+                continue
+        raise RuntimeError('no AWB auto v4l2 control found')
     if option == 'autofocus':
         # Newer kernel name is focus_automatic_continuous; older is focus_auto.
         try:    raw = _get('focus_automatic_continuous')

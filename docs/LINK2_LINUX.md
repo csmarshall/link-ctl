@@ -20,13 +20,15 @@ Device: **Insta360 Link 2** (`2e1a:4c04`)
 |-----|-----|-------|
 | 0x02 | 61 | AI video mode — SET via ioctl RMW; GET via ioctl. **Link 2 readback: byte[0]=0xFF when tracking** (OG Link uses 0x01) |
 | 0x09 | 2 | Exposure compensation |
-| 0x1A | 8 | Pan/tilt readback: **tilt, pan** int32 LE |
+| 0x1A | 8 | Pan/tilt readback on OG Link (**stale on Link 2** — use v4l2) |
 | 0x1B | 2 | Func-enable bitmask (`f50b` sample) |
 | 0x1E | 1 | AE mode: `2`=auto, `1`=manual |
 
 ### Broken on stock Linux driver
 
-- V4L2 `pan_absolute` / `tilt_absolute`: readback returns garbage; SET to `0` fails with "Numerical result out of range"
+- V4L2 `pan_absolute` / `tilt_absolute`: **GET reliable on Link 2**; SET to `(0,0)` via v4l2 fails — use libusb CT `0x0D`
+- XU1 sel `0x1A` readback: **stale on Link 2** (tilt word stuck ~`-306000`); use v4l2 for pan/tilt readback
+- V4L2 AWB control is named `white_balance_automatic` (not `white_balance_temperature_auto`)
 - `UVCIOC_CTRL_QUERY` on CT (unit 1) and PU (unit 5): `ENOENT` — use libusb instead
 
 ### CT/PU access
@@ -53,7 +55,7 @@ make -C tools uvc-probe-linux
 python3 link_usb_linux.py
 python3 link_ctl.py status autoexposure
 python3 link_ctl.py track on
-python3 tools/validate.py --backend usb --only zoom,track,autoexposure
+python3 tools/validate.py --backend usb --only zoom,track,center,autoexposure,awb,hdr,mirror,brightness
 ./tools/uvc-probe-linux snapshot   # libusb; use xu_snapshot_linux.py while streaming
 python3 tools/xu_snapshot_linux.py # ioctl snapshot (preferred on Linux)
 ```

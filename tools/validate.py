@@ -392,17 +392,22 @@ def make_tests() -> list[TestCase]:
     ]
 
 
-def run_usb_test(name: str, apply, check, restore=None) -> Result:
+def run_usb_test(name: str, apply, check, restore=None, settle: float = 1.0) -> Result:
     _log(name)
     try:
         apply()
-        time.sleep(1.0)
+        time.sleep(settle)
         passed, msg = check()
         if restore:
             restore()
             time.sleep(0.5)
         return Result(name, passed, msg)
     except Exception as e:
+        if restore:
+            try:
+                restore()
+            except Exception:
+                pass
         return Result(name, False, str(e))
 
 
@@ -413,6 +418,51 @@ def run_usb_all(only: list[str]) -> int:
         print('✗ USB-direct backend unavailable.', file=sys.stderr)
         return 2
 
+    def _save_bit(bit: int) -> bool:
+        return lc._bitmask_get_bit(bit)
+
+    def _restore_bit(bit: int, was_on: bool) -> None:
+        lc._bitmask_set_bit(bit, was_on)
+
+    ctx: dict = {}
+
+    def _center_apply() -> None:
+        lc.write_ai_mode('normal')
+        ctx['zoom'] = lc.read_zoom()
+        lc.write_zoom(100)
+        lc.write_pantilt(0, 0)
+        time.sleep(1.0)
+        lc.write_pantilt(0, 0)
+        try:
+            import link_usb_linux as ul
+            ul.recover()
+        except Exception:
+            pass
+
+    def _check_center() -> tuple[bool, str]:
+        for attempt in range(12):
+            try:
+                p, t = lc.read_pantilt()
+                z = lc.read_zoom()
+                ok = p == 0 and t == 0 and z == 100
+                if ok or attempt == 11:
+                    return ok, f'pan={p} tilt={t} zoom={z}'
+            except Exception as e:
+                if attempt == 11:
+                    return False, str(e)
+            time.sleep(0.5)
+        return False, 'center check timed out'
+
+    def _awb_apply_off() -> None:
+        ctx['awb'] = lc.read_status_usb('awb')['is_on']
+        if ctx['awb']:
+            lc._uvc_set(5, 0x0B, bytes([0]))
+
+    def _awb_restore() -> None:
+        if ctx.get('awb'):
+            lc._uvc_set(5, 0x0B, bytes([1]))
+
+    # center runs last — CT pan/tilt SET uses a kernel detach/rebind cycle.
     specs = [
         ('zoom', lambda: lc.write_zoom(200),
          lambda: (lc.read_zoom() == 200, f'zoom={lc.read_zoom()}'),
@@ -423,16 +473,39 @@ def run_usb_all(only: list[str]) -> int:
         ('autoexposure', lambda: lc._uvc_set(9, 0x1e, bytes([1])),
          lambda: (not lc.read_status_usb('autoexposure')['is_on'], lc.read_status_usb('autoexposure')['display']),
          lambda: lc._uvc_set(9, 0x1e, bytes([2]))),
+        ('awb', _awb_apply_off,
+         lambda: (not lc.read_status_usb('awb')['is_on'], lc.read_status_usb('awb')['display']),
+         _awb_restore),
+        ('hdr', lambda: (ctx.__setitem__('hdr', _save_bit(lc.BIT_HDR)), lc._bitmask_set_bit(lc.BIT_HDR, True))[-1],
+         lambda: (lc.read_status_usb('hdr')['is_on'], lc.read_status_usb('hdr')['display']),
+         lambda: _restore_bit(lc.BIT_HDR, ctx.get('hdr', False))),
+        ('mirror', lambda: (ctx.__setitem__('mirror', _save_bit(lc.BIT_MIRROR)), lc._bitmask_set_bit(lc.BIT_MIRROR, True))[-1],
+         lambda: (lc.read_status_usb('mirror')['is_on'], lc.read_status_usb('mirror')['display']),
+         lambda: _restore_bit(lc.BIT_MIRROR, ctx.get('mirror', False))),
+        ('brightness', lambda: (ctx.__setitem__('bright', lc.read_status_usb('brightness')['value']), lc._uvc_set(5, 0x02, bytes([75])))[-1],
+         lambda: (lc.read_status_usb('brightness')['value'] == 75, f"brightness={lc.read_status_usb('brightness')['value']}"),
+         lambda: lc._uvc_set(5, 0x02, bytes([ctx.get('bright', 50)]))),
+        ('center', _center_apply,
+         _check_center,
+         lambda: lc.write_zoom(ctx.get('zoom', 100))),
     ]
     if only:
         specs = [s for s in specs if s[0] in only]
 
+    settle_map = {'center': 5.0, 'track': 2.0}
+
     results = []
     for name, apply, check, restore in specs:
         print(f'[TEST] {name}')
-        r = run_usb_test(name, apply, check, restore)
+        r = run_usb_test(name, apply, check, restore, settle=settle_map.get(name, 1.0))
         print(f'  [{"PASS" if r.passed else "FAIL"}] {r.message}')
         results.append(r)
+        if name == 'center':
+            try:
+                import link_usb_linux as ul
+                ul.recover()
+            except Exception:
+                pass
     failed = sum(1 for r in results if not r.passed)
     print(f'Results: {len(results)-failed}/{len(results)} passed')
     return 0 if failed == 0 else 1
