@@ -631,9 +631,15 @@ def _ai_mode_len() -> int:
     return AI_MODE_LEN
 
 def write_ai_mode(mode_name: str) -> None:
+    """Set AI video mode via XU9 sel 0x02.
+
+    Zero-fill the full buffer before writing byte[0]/byte[1]. Link 2 (61-byte)
+    rejects RMW that leaves stale tail bytes or a lingering mode flag in byte[1].
+    Matches vrwallace Insta360-Link-1-and-2-Controller-for-Linux XU_SetMode.
+    """
     mode_id, flag = AI_MODE_BYTES[mode_name]
     ln = _ai_mode_len()
-    buf = bytearray(_uvc_get(9, AI_MODE_SEL, ln))
+    buf = bytearray(ln)  # zero entire buffer — do not read-modify-write
     buf[0] = mode_id
     buf[1] = flag
     _uvc_set(9, AI_MODE_SEL, bytes(buf))
@@ -658,10 +664,21 @@ def read_ai_mode() -> str:
     for name, (m, f) in AI_MODE_BYTES.items():
         if m == mid and (len(raw) < 2 or f == flag):
             return name
-    # Link 2 (61-byte buffer): steady-state tracking reads byte[0]=0xFF, not 0x01.
-    # OG Link briefly shows 0xFF during transition then settles to 0x01.
-    if mid == 0xFF and _ai_mode_len() >= 61:
-        return 'track'
+    # Link 2 (61-byte buffer): byte[0] is the steady-state mode id; byte[1] is the
+    # OG Link flag on SET but often 0x00 or stale on GET. When byte[0]==0xFF (active),
+    # byte[1] disambiguates: 0x00=track, 0x01=whiteboard, 0x03=overhead, 0x10=deskview.
+    if _ai_mode_len() >= 61:
+        if mid == 0x00:
+            return 'normal'
+        link2_by_mode_id = {0x01: 'track', 0x04: 'whiteboard', 0x05: 'overhead', 0x06: 'deskview'}
+        if mid in link2_by_mode_id:
+            return link2_by_mode_id[mid]
+        link2_by_flag = {0x00: 'track', 0x01: 'whiteboard', 0x03: 'overhead'}
+        if mid == 0xFF and flag in link2_by_flag:
+            return link2_by_flag[flag]
+        # 0xFF/0x10 after deskview off is a stale byte[1]; active deskview uses byte[0]=0x06.
+        if mid == 0xFF and flag in (0x10, 0x11):
+            return 'track'
     return f'unknown(0x{mid:02x}/0x{flag:02x})'
 
 # Link 2 / 2 Pro privacy (XU2 unit 10). OG Link ignores these writes.
