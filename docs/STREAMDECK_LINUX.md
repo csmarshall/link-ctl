@@ -74,6 +74,62 @@ Use `--quiet` so Stream Deck does not capture informational stdout.
 
 Map **Privacy** to `privacy_on.sh` / `privacy_off.sh` (Link 2 only).
 
+## OpenDeck (recommended on Linux)
+
+[OpenDeck](https://github.com/nekename/OpenDeck) drives Elgato hardware on Linux using
+JSON profiles and the **Starter Pack** plugin's **Run Command** action.
+
+### Install profile
+
+With the Stream Deck plugged in and OpenDeck running at least once:
+
+```bash
+cd ~/Projects/link-ctl
+bash streamdeck/opendeck/install.sh
+```
+
+This writes `Link2.json` into every `~/.config/opendeck/profiles/sd-*/`
+folder, selects it as the active profile, and **restarts OpenDeck** (required —
+OpenDeck only rescans profiles on startup).
+
+### Select the profile
+
+After install, the deck should load **Link2** automatically. To switch back later,
+use the profile dropdown under your device name in the OpenDeck window (below the
+device selector), or:
+
+```bash
+opendeck --process-message '{
+  "event": "switchProfile",
+  "payload": {
+    "device": "sd-A00SA5022NHZOS",
+    "profile": "Link2"
+  }
+}'
+```
+
+Replace `sd-A00SA5022NHZOS` with your device id (`ls ~/.config/opendeck/profiles/`).
+
+### Regenerate after moving the repo
+
+```bash
+python3 tools/build_opendeck_profile.py --install
+```
+
+Paths in the profile point at absolute script locations under `streamdeck/`; re-run
+`--install` if you move the checkout.
+
+### OpenDeck 15-key layout
+
+```
+[ Track    ] [ Track Off] [ Desk     ] [ Desk Off ] [ Center   ]
+[ Overhead ] [ Over Off ] [ Board    ] [ Board Off] [ Mirror   ]
+[ Zoom +   ] [ Zoom −   ] [ Normal   ] [ Privacy  ] [ Priv Off ]
+```
+
+Requires **Starter Pack** (`com.amansprojects.starterpack.sdPlugin`) enabled in
+OpenDeck — same plugin used by the default volume profile.
+
 ## Performance
 
 - First run after plug-in: ~0.5–1 s (USB open + ioctl).
@@ -89,5 +145,6 @@ Map **Privacy** to `privacy_on.sh` / `privacy_off.sh` (Link 2 only).
 | `libusb` / permission errors | Install udev rule above |
 | Privacy fails on OG Link | Expected — use Link 2 / 2 Pro only |
 | Button shows text output | Ensure `--quiet` or use provided scripts |
+| Yellow ! on every key, no labels | Regenerate with `build_opendeck_profile.py --install` — empty `image` triggers OpenDeck's alert icon |
 
 See also [`docs/LINK2_LINUX.md`](LINK2_LINUX.md) for USB backend details.

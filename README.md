@@ -587,7 +587,14 @@ The `streamdeck/` directory contains ready-to-use shell scripts for **macOS and
 Linux**. On Linux they talk USB-direct to the camera (no Insta360 desktop app).
 
 See **[`docs/STREAMDECK_LINUX.md`](docs/STREAMDECK_LINUX.md)** for Link 2 setup
-with Elgato Stream Deck on Linux.
+with Elgato Stream Deck or **[OpenDeck](https://github.com/nekename/OpenDeck)** on Linux.
+
+**OpenDeck (one-shot install):**
+
+```bash
+bash streamdeck/opendeck/install.sh
+# restarts OpenDeck and activates profile "Link2"
+```
 
 ### Setup
 
