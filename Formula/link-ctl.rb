@@ -8,6 +8,7 @@ class LinkCtl < Formula
   license "MIT"
 
   depends_on "python@3.11"
+  depends_on "python@3.11" => :test
 
   resource "websockets" do
     url "https://files.pythonhosted.org/packages/04/24/4b2031d72e840ce4c1ccb255f693b15c334757fc50023e4db9537080b8c4/websockets-16.0.tar.gz"
