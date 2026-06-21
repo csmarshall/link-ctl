@@ -317,6 +317,45 @@ class TestReadStatusUsb(unittest.TestCase):
             link_ctl.read_status_usb('smartcomposition')
 
 
+class TestReadAiModeLink2(unittest.TestCase):
+    """Link 2 readback: byte[0] steady-state; stale byte[1] must not mis-map modes."""
+
+    def _read(self, raw: bytes, *, reset_last: bool = True) -> str:
+        pad = raw + bytes(max(0, 61 - len(raw)))
+        with mock.patch.object(link_ctl, '_ai_mode_get_raw', return_value=pad[:61]):
+            with mock.patch.object(link_ctl, '_ai_mode_len', return_value=61):
+                with mock.patch.object(link_ctl, '_link2', return_value=True):
+                    if reset_last:
+                        link_ctl._last_ai_mode_written = None
+                        link_ctl._last_ai_mode_ts = 0.0
+                    return link_ctl.read_ai_mode()
+
+    def test_steady_normal_ignores_stale_byte1(self):
+        self.assertEqual(self._read(bytes([0x00, 0x10])), 'normal')
+
+    def test_steady_overhead_ignores_stale_byte1(self):
+        self.assertEqual(self._read(bytes([0x05, 0x10])), 'overhead')
+
+    def test_ff_stale_10_is_deskview_without_recent_write(self):
+        self.assertEqual(self._read(bytes([0xFF, 0x10])), 'deskview')
+
+    def test_ff_stale_10_after_overhead_write_uses_last_written(self):
+        link_ctl._last_ai_mode_written = 'overhead'
+        link_ctl._last_ai_mode_ts = __import__('time').monotonic()
+        self.assertEqual(self._read(bytes([0xFF, 0x10]), reset_last=False), 'overhead')
+
+    def test_ff_00_is_transition_not_track(self):
+        self.assertEqual(self._read(bytes([0xFF, 0x00])), 'transition')
+
+    def test_ff_11_is_active_deskview(self):
+        self.assertEqual(self._read(bytes([0xFF, 0x11])), 'deskview')
+
+    def test_ff_10_after_track_write_uses_last_written(self):
+        link_ctl._last_ai_mode_written = 'track'
+        link_ctl._last_ai_mode_ts = __import__('time').monotonic()
+        self.assertEqual(self._read(bytes([0xFF, 0x10]), reset_last=False), 'track')
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 4. WebSocket reader with sample DeviceInfoNotify payload
 # ──────────────────────────────────────────────────────────────────────────────

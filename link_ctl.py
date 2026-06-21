@@ -577,11 +577,15 @@ def _bitmask_get() -> int:
 
 def _bitmask_set_bit(bit: int, on: bool) -> None:
     val = _bitmask_get()
+    if bool(val & (1 << bit)) == on:
+        return
     val = val | (1 << bit) if on else val & ~(1 << bit)
     wire = val.to_bytes(2, 'little')
     _uvc_set(BITMASK_UNIT, BITMASK_SEL, wire)
-    # Link 2 ioctl SET can appear to succeed while the bit does not stick; verify once.
-    if bool(_bitmask_get() & (1 << bit)) != on:
+    # Link 2 ioctl SET can appear to succeed while the bit does not stick; verify/retry.
+    for _ in range(2):
+        if bool(_bitmask_get() & (1 << bit)) == on:
+            return
         _uvc_set(BITMASK_UNIT, BITMASK_SEL, wire)
 
 def _bitmask_get_bit(bit: int) -> bool:
@@ -601,12 +605,16 @@ AI_MODE_BYTES = {
 
 _ai_mode_len_cache: int | None = None
 _privacy_len_cache: int | None = None
+_last_ai_mode_written: str | None = None
+_last_ai_mode_ts: float = 0.0
 
 def reset_usb_caches() -> None:
     """Clear runtime USB probe caches (call after driver rebind)."""
-    global _ai_mode_len_cache, _privacy_len_cache
+    global _ai_mode_len_cache, _privacy_len_cache, _last_ai_mode_written, _last_ai_mode_ts
     _ai_mode_len_cache = None
     _privacy_len_cache = None
+    _last_ai_mode_written = None
+    _last_ai_mode_ts = 0.0
 
 def _ai_mode_len() -> int:
     """Return the firmware-reported AI mode buffer length (52 OG, 61 Link 2)."""
@@ -659,50 +667,78 @@ def _ai_mode_get_raw() -> bytes:
         raise
 
 def _apply_ai_mode_buffer(mode_id: int, flag: int) -> None:
-    """Write byte[0]/byte[1] of the AI mode buffer (XU9 sel 0x02)."""
+    """Write byte[0]/byte[1] of the AI mode buffer (XU9 sel 0x02).
+
+    Link 2: zero-fill bytes 0..51 (vrwallace XU_SetMode) but preserve calibration
+    tail at offset 52+. Full-buffer RMW leaves stale byte[1] (often 0x10) in the
+    SET payload and breaks overhead/deskview; wiping the whole 61 bytes breaks SET.
+    """
     ln = _ai_mode_len()
     if _link2() and ln >= 61:
-        # Link 2: preserve tail calibration bytes (offset 52+). Zero-fill wipes them
-        # and mode SET is ignored or misbehaves (overhead/deskview appear broken).
+        buf = bytearray(ln)
         try:
-            buf = bytearray(_ai_mode_get_raw())
+            cur = _ai_mode_get_raw()
+            if len(cur) >= 61:
+                buf[52:] = cur[52:]
         except OSError:
-            buf = bytearray(ln)
+            pass
     else:
         buf = bytearray(ln)
     buf[0] = mode_id
     buf[1] = flag
     _uvc_set(9, AI_MODE_SEL, bytes(buf))
 
+def _ai_mode_wire_id() -> int | None:
+    """Return steady-state byte[0] from the AI mode buffer, or None on read failure."""
+    try:
+        raw = _ai_mode_get_raw()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    mid = raw[0]
+    if mid == 0xFF:
+        time.sleep(0.5)
+        try:
+            raw = _ai_mode_get_raw()
+            mid = raw[0] if raw else 0xFF
+        except OSError:
+            pass
+    return mid
+
 def write_ai_mode(mode_name: str) -> None:
     """Set AI video mode via XU9 sel 0x02.
 
-    OG Link: zero-fill 52-byte buffer. Link 2 (61-byte): read-modify-write so tail
-    bytes stay intact; always clear byte[1] when returning to normal so deskview
-    flag 0x10 does not linger. Exit the current mode and privacy before entering a
-    new AI mode on Link 2 (matches vrwallace SetCameraMode sequencing).
+    OG Link: zero-fill 52-byte buffer. Link 2 (61-byte): zero-fill bytes 0..51,
+    preserve tail 52+, exit to normal and disable privacy before a new mode
+    (matches vrwallace SetCameraMode sequencing).
     """
+    global _last_ai_mode_written, _last_ai_mode_ts
     mode_id, flag = AI_MODE_BYTES[mode_name]
     ln = _ai_mode_len()
 
-    if _link2() and ln >= 61 and mode_name != 'normal':
-        cur = read_ai_mode()
-        if cur not in ('normal', mode_name) and not cur.startswith('unknown'):
-            _apply_ai_mode_buffer(0, 0)
-            time.sleep(0.5)
-        if read_privacy():
-            write_privacy(False)
-            time.sleep(0.5)
-
-    if mode_name == 'normal' and _link2() and ln >= 61:
-        _apply_ai_mode_buffer(0, 0)
-    elif _link2() and ln >= 61:
+    if _link2() and ln >= 61:
+        mid = _ai_mode_wire_id()
+        if mode_name == 'normal':
+            if mid == 0x00:
+                return
+        elif mid == mode_id:
+            return
+        if mode_name != 'normal':
+            if read_privacy():
+                write_privacy(False)
+                time.sleep(0.5)
+            if mid not in (None, 0x00, mode_id):
+                _apply_ai_mode_buffer(0, 0)
+                time.sleep(0.5)
         _apply_ai_mode_buffer(mode_id, flag)
     else:
         buf = bytearray(ln)
         buf[0] = mode_id
         buf[1] = flag
         _uvc_set(9, AI_MODE_SEL, bytes(buf))
+    _last_ai_mode_written = mode_name
+    _last_ai_mode_ts = time.monotonic()
     time.sleep(1.5)  # firmware reports 0xFF during transition (API.md)
 
 def read_ai_mode() -> str:
@@ -724,21 +760,45 @@ def read_ai_mode() -> str:
     for name, (m, f) in AI_MODE_BYTES.items():
         if m == mid and (len(raw) < 2 or f == flag):
             return name
-    # Link 2 (61-byte buffer): byte[0] is the steady-state mode id; byte[1] is the
-    # OG Link flag on SET but often 0x00 or stale on GET. When byte[0]==0xFF (active),
-    # byte[1] disambiguates: 0x00=track, 0x01=whiteboard, 0x03=overhead, 0x10=deskview.
+    # Link 2 (61-byte buffer): byte[0] is authoritative in steady state; byte[1] on
+    # GET is often stale (0x10 lingers after deskview). During 0xFF transitions,
+    # prefer a recent write_ai_mode() target over flag-only guesses.
     if _ai_mode_len() >= 61:
         if mid == 0x00:
             return 'normal'
         link2_by_mode_id = {0x01: 'track', 0x04: 'whiteboard', 0x05: 'overhead', 0x06: 'deskview'}
         if mid in link2_by_mode_id:
             return link2_by_mode_id[mid]
-        link2_by_flag = {0x00: 'track', 0x01: 'whiteboard', 0x03: 'overhead'}
-        if mid == 0xFF and flag in link2_by_flag:
-            return link2_by_flag[flag]
-        # Active deskview transition on Link 2: 0xFF/0x10 or 0xFF/0x11 (steady: byte[0]=0x06).
-        if mid == 0xFF and flag in (0x10, 0x11):
-            return 'deskview'
+        if mid == 0xFF:
+            if (_last_ai_mode_written
+                    and (time.monotonic() - _last_ai_mode_ts) < 8.0):
+                return _last_ai_mode_written
+            # Give firmware time to leave 0xFF before flag-only guesses (CLI
+            # status runs in a fresh process so _last_ai_mode_written is usually unset).
+            time.sleep(1.0)
+            try:
+                raw = _ai_mode_get_raw()
+                mid = raw[0]; flag = raw[1] if len(raw) > 1 else 0
+                if mid == 0x00:
+                    return 'normal'
+                if mid in link2_by_mode_id:
+                    return link2_by_mode_id[mid]
+            except Exception:
+                pass
+            # 0xFF/0x00 is a generic transition — not reliably track or normal.
+            if flag == 0x00:
+                return 'transition'
+            link2_by_flag = {0x01: 'whiteboard', 0x03: 'overhead'}
+            if flag in link2_by_flag:
+                return link2_by_flag[flag]
+            # 0x10 is the deskview SET flag but also stale in byte[1] during other modes.
+            if flag == 0x11:
+                return 'deskview'
+            if flag == 0x10:
+                if _last_ai_mode_written not in (None, 'deskview'):
+                    return 'transition'
+                return 'deskview'
+            return 'transition'
     return f'unknown(0x{mid:02x}/0x{flag:02x})'
 
 # Link 2 / 2 Pro privacy (XU2 unit 10). OG Link ignores these writes.
@@ -1155,6 +1215,9 @@ def usb_image_dispatch(args) -> None:
             if state in (None, 'toggle'):
                 state = 'off' if cur == target_mode else 'on'
             new_mode = target_mode if state == 'on' else 'normal'
+            if state == 'on' and cur == target_mode:
+                _info(f"{cmd}: already {target_mode}")
+                return
             write_ai_mode(new_mode)
             _info(f"{cmd}: {cur} → {new_mode}")
 
