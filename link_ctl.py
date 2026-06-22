@@ -727,15 +727,35 @@ def _link2_track_stuck() -> bool:
         return False
     return len(raw) >= 2 and raw[0] == 0xFF and raw[1] == 0x10
 
-def _link2_exit_track_for_mode(target: str) -> None:
-    """Best-effort exit from AI tracking before another mode SET."""
-    if target == 'track' or not _link2_track_stuck():
-        return
+def _link2_try_exit_track() -> bool:
+    """Return True when 0xFF/0x10 cleared or AI mode SET is responsive again."""
+    if not _link2_track_stuck():
+        return True
     for _ in range(4):
         _apply_ai_mode_buffer(0, 0)
         time.sleep(2.0)
         if not _link2_track_stuck():
-            return
+            return True
+    if _usb_backend is not None:
+        try:
+            import link_usb_linux as ul
+            if ul.recover_ai_mode_stuck():
+                for _ in range(4):
+                    _apply_ai_mode_buffer(0, 0)
+                    time.sleep(2.0)
+                    if not _link2_track_stuck():
+                        return True
+        except Exception:
+            pass
+    return not _link2_track_stuck()
+
+
+def _link2_exit_track_for_mode(target: str) -> None:
+    """Best-effort exit from AI tracking before another mode SET."""
+    if target == 'track' or not _link2_track_stuck():
+        return
+    if _link2_try_exit_track():
+        return
     raise RuntimeError(
         'Link 2 is stuck in AI tracking (0xFF/0x10); USB mode SET has no effect. '
         'Unplug/replug the camera once. Avoid libusb reset recovery while /dev/video '
@@ -756,8 +776,10 @@ def write_ai_mode(mode_name: str) -> None:
     ln = _ai_mode_len()
 
     if _link2() and ln >= 61:
-        if mode_name != 'track':
+        if mode_name not in ('track', 'normal'):
             _link2_exit_track_for_mode(mode_name)
+        elif mode_name == 'normal':
+            _link2_try_exit_track()
         mid = _ai_mode_wire_id()
         if mode_name != 'normal':
             if read_privacy():

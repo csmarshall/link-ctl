@@ -75,7 +75,18 @@ recover() {
   # when LINK_CTL_SMOKE_CENTER=1 or LINK_CTL_USB_DETACH=1.
   "$PY" "$ROOT/link_ctl.py" privacy off >/dev/null 2>&1 || true
   "$PY" "$ROOT/link_ctl.py" mirror off >/dev/null 2>&1 || true
-  "$PY" "$ROOT/link_ctl.py" normal >/dev/null 2>&1 || true
+  if ! "$PY" "$ROOT/link_ctl.py" normal >/dev/null 2>&1; then
+    # 0xFF/0x10 track-stuck: sysfs rebind when permitted, then retry normal.
+    "$PY" -c "
+import sys; sys.path.insert(0, '$ROOT')
+import link_ctl as lc
+import link_usb_linux as ul
+if lc._link2() and lc._link2_track_stuck():
+    ul.recover_ai_mode_stuck(verbose=True)
+    lc.reset_usb_caches()
+" 2>/dev/null || true
+    "$PY" "$ROOT/link_ctl.py" normal >/dev/null 2>&1 || true
+  fi
   sleep 1
   if [[ "${LINK_CTL_SMOKE_CENTER:-}" == "1" || "${LINK_CTL_USB_DETACH:-}" == "1" ]]; then
     local center_args=()
@@ -84,6 +95,30 @@ recover() {
     sleep 1
   fi
   sleep 2
+}
+
+preflight_ai() {
+  if ! "$PY" -c "
+import sys
+sys.path.insert(0, '$ROOT')
+import link_ctl as lc
+if not lc._link2():
+    raise SystemExit(0)
+if not lc._link2_track_stuck():
+    raise SystemExit(0)
+if lc._link2_try_exit_track():
+    raise SystemExit(0)
+import link_usb_linux as ul
+if ul.recover_ai_mode_stuck(verbose=True):
+    lc.reset_usb_caches()
+    if lc._link2_try_exit_track():
+        raise SystemExit(0)
+print('BLOCKED: AI mode SET ignored (0xFF/0x10). Unplug/replug Link once, then re-run.', file=sys.stderr)
+raise SystemExit(1)
+" 2>&1; then
+    echo "FAIL: AI mode preflight — unplug/replug Link and retry" >&2
+    exit 1
+  fi
 }
 
 opendeck() {
@@ -99,6 +134,7 @@ opendeck() {
 }
 
 recover
+preflight_ai
 echo "baseline: mode=$(status mode) mirror=$(status mirror) privacy=$(status privacy)"
 raw_xu
 capture_step "baseline"

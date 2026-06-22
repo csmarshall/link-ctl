@@ -208,6 +208,58 @@ def recover() -> None:
         pass
 
 
+def recover_ai_mode_stuck(*, verbose: bool = False) -> bool:
+    """Recover when Link 2 AI mode SET is ignored (steady 0xFF/0x10 readback).
+
+    Tries handle reopen, sysfs uvcvideo unbind/rebind (when permitted), then
+  probes whether a normal-mode SET changes readback. Returns True when SET
+    works again (readback left 0xFF/0x10 or reached 0x00).
+    """
+    import time
+
+    global _video_dev_cache
+
+    def _say(msg: str) -> None:
+        if verbose:
+            print(msg)
+
+    _video_dev_cache = None
+    _invalidate_handle()
+    ok, detail = _reset_handle_reopen()
+    _say(f'handle reopen: {"ok" if ok else "failed"} — {detail}')
+
+    results = _rebind_uvcvideo_sysfs(unbind_first=True)
+    for rok, rdetail in results:
+        _say(f'sysfs: {"ok" if rok else "failed"} — {rdetail}')
+    if not any(r[0] for r in results):
+        if _bootstrap_uvcvideo():
+            _say('bootstrap: attached uvcvideo via libusb')
+
+    try:
+        _wait_for_video_device(timeout=15.0)
+    except RuntimeError:
+        _say('recover_ai_mode_stuck: no /dev/video* after rebind')
+        return False
+
+    _invalidate_handle()
+    try:
+        import link_ctl
+        link_ctl.reset_usb_caches()
+        if not link_ctl._link2_track_stuck():
+            return True
+        before = link_ctl._ai_mode_get_raw()[:2]
+        link_ctl._apply_ai_mode_buffer(0, 0)
+        time.sleep(2.0)
+        link_ctl.reset_usb_caches()
+        after = link_ctl._ai_mode_get_raw()[:2]
+        ok = before != after or after[0] == 0x00
+        _say(f'AI readback: {before[0]:02x}/{before[1]:02x} → {after[0]:02x}/{after[1]:02x}')
+        return ok
+    except Exception as exc:
+        _say(f'recover_ai_mode_stuck: {exc}')
+        return False
+
+
 def _video_device_ready() -> str | None:
     """Return openable Insta360 /dev/video path, or None."""
     global _video_dev_cache
