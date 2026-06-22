@@ -212,7 +212,7 @@ def recover_ai_mode_stuck(*, verbose: bool = False) -> bool:
     """Recover when Link 2 AI mode SET is ignored (steady 0xFF/0x10 readback).
 
     Tries handle reopen, sysfs uvcvideo unbind/rebind (when permitted), then
-  probes whether a normal-mode SET changes readback. Returns True when SET
+    probes whether a normal-mode SET changes readback. Returns True when SET
     works again (readback left 0xFF/0x10 or reached 0x00).
     """
     import time

@@ -9,7 +9,7 @@ Device: **Insta360 Link 2** (`2e1a:4c04`)
 | `link_usb_linux.py` | Hybrid ioctl (XU 9/10/11) + libusb/v4l2 (CT/PU) |
 | `tools/uvc-probe-linux` | libusb probe; `--detach` for CT/PU |
 | `link_ctl.py` Linux dispatch | USB-direct first; v4l2 fallback |
-| `tools/validate.py --backend usb` | 8/8 round-trip tests on Link 2 |
+| `tools/validate.py --backend usb` | 10/10 round-trip tests on Link 2 (AI modes verified in-stream) |
 | `streamdeck/*.sh` | Linux Stream Deck scripts (USB-direct) |
 | `streamdeck/opendeck/` | OpenDeck profile + `install.sh` |
 | `tools/99-insta360-link.rules` | udev permissions for libusb |
@@ -117,11 +117,13 @@ and survives a stream restart.
 - [ ] Smart composition master switch (bit 0 of `0x1B` — unconfirmed)
 - [ ] Full `snapshot` inventory diff vs OG Link
 
-Probe AI modes (camera must be plugged in; ioctl-only, no detach):
+Probe AI modes (camera must be plugged in; ioctl-only, no detach). The
+validator drives each mode and verifies byte[0] **while holding a video stream
+open** — the only way to observe the live modes (overhead/whiteboard) before
+they revert on stream stop:
 
 ```bash
-python3 tools/probe_ai_modes.py          # recover() between modes, 3s settle
-LINK_CTL_PROBE_SETTLE=4 python3 tools/probe_ai_modes.py
+python3 tools/validate.py --backend usb --only track,overhead,deskview
 ```
 
 ## Safe testing (avoid camera hangs)
@@ -177,7 +179,6 @@ link-ctl recover --verbose
 | `LINK_CTL_SKIP_CENTER=1` | Skip center test in `validate.py --backend usb` |
 | `LINK_CTL_NO_DETACH=1` | Never detach uvcvideo (default via `link-ctl`) |
 | `LINK_CTL_USB_DETACH=1` | Allow detach for pan/tilt (legacy opt-in) |
-| `LINK_CTL_PROBE_SETTLE` | Seconds after mode SET in `probe_ai_modes.py` (default 3) |
 
 ## Quick test
 

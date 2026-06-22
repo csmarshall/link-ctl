@@ -23,7 +23,7 @@ import link_ctl as lc  # noqa: E402
 
 
 def _video_device() -> str:
-    return os.environ.get('LINK_CTL_VIDEO_DEVICE', '/dev/video0')
+    return os.environ.get('LINK_CTL_V4L2_DEVICE', '/dev/video0')
 
 
 def read_diagnostics() -> dict:

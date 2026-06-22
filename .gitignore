@@ -37,6 +37,8 @@ mobileui-screenshots/
 # Claude memory
 .claude/
 
+# Lock files — project ships via pip/Homebrew; pyproject.toml is the source of truth
+uv.lock
+
 # macOS
 .DS_Store
-tools/uvc-probe-linux
