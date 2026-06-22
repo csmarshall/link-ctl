@@ -839,6 +839,78 @@ def read_pantilt_v4l2() -> tuple[int, int]:
     return _v4l2_get_ctrl('pan_absolute'), _v4l2_get_ctrl('tilt_absolute')
 
 
+import contextlib
+
+
+def _stream_cmd(device: str, seconds: float) -> list[str] | None:
+    """Build a bounded capture command (ffmpeg preferred, v4l2-ctl fallback)."""
+    import shutil
+    if shutil.which('ffmpeg'):
+        return [
+            'ffmpeg', '-hide_banner', '-loglevel', 'error',
+            '-f', 'v4l2', '-input_format', 'mjpeg',
+            '-video_size', '1280x720', '-i', device,
+            '-t', f'{seconds:.1f}', '-f', 'null', '-',
+        ]
+    if shutil.which('v4l2-ctl'):
+        # Stream enough frames to span ~seconds at 30fps.
+        count = max(1, int(seconds * 30))
+        return [
+            'v4l2-ctl', '-d', device,
+            '--set-fmt-video=width=1280,height=720,pixelformat=MJPG',
+            '--stream-mmap', f'--stream-count={count}', '--stream-to', '/dev/null',
+        ]
+    return None
+
+
+@contextlib.contextmanager
+def video_stream(seconds: float = 8.0, device: str | None = None):
+    """Hold a v4l2 capture stream open for the duration of the block.
+
+    The Link 2 AI engine (track/overhead/deskview/whiteboard) only engages and
+    reports its real mode byte while the video pipeline is streaming; with no
+    stream the AI mode buffer reads back 0xFF ("idle/transition"), which makes a
+    SET look like it "did not stick". Holding a stream open during SET + GET
+    readback matches what the desktop app does.
+
+    Yields True when a stream was started, False otherwise (e.g. /dev/video busy
+    with another app, or no ffmpeg/v4l2-ctl). The stream auto-stops on exit.
+    """
+    import subprocess
+    import time
+
+    dev = device or _find_video_device()
+    proc = None
+    started = False
+    if dev:
+        cmd = _stream_cmd(dev, seconds)
+        if cmd is not None:
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL)
+                # Let it claim the device and reach STREAMON before we report ready.
+                time.sleep(1.0)
+                started = proc.poll() is None
+                if not started:
+                    proc = None
+            except Exception:
+                proc = None
+                started = False
+    try:
+        yield started
+    finally:
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+
 def _video_device() -> str:
     dev = _find_video_device()
     if dev:

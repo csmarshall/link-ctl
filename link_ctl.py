@@ -731,11 +731,21 @@ def _link2_try_exit_track() -> bool:
     """Return True when 0xFF/0x10 cleared or AI mode SET is responsive again."""
     if not _link2_track_stuck():
         return True
-    for _ in range(4):
-        _apply_ai_mode_buffer(0, 0)
-        time.sleep(2.0)
-        if not _link2_track_stuck():
-            return True
+    # Hold a stream open so the AI engine actually processes the OFF write.
+    try:
+        import link_usb_linux as ul
+        with ul.video_stream(seconds=8.0) as streaming:
+            for _ in range(4):
+                _apply_ai_mode_buffer(0, 0)
+                time.sleep(1.0 if streaming else 2.0)
+                if not _link2_track_stuck():
+                    return True
+    except Exception:
+        for _ in range(4):
+            _apply_ai_mode_buffer(0, 0)
+            time.sleep(2.0)
+            if not _link2_track_stuck():
+                return True
     if _usb_backend is not None:
         try:
             import link_usb_linux as ul
@@ -761,12 +771,80 @@ def _link2_exit_track_for_mode(target: str) -> None:
         'Unplug/replug the camera once. Avoid libusb reset recovery while /dev/video '
         'exists — it can leave this state.')
 
+def _ai_mode_byte0() -> int | None:
+    """Read AI mode buffer byte[0] once (no settle sleep), or None on failure."""
+    try:
+        raw = _ai_mode_get_raw()
+    except OSError:
+        return None
+    return raw[0] if raw else None
+
+
+def _link2_set_ai_mode_streamed(mode_name: str, mode_id: int, flag: int) -> None:
+    """Set Link 2 AI mode while holding a video stream open, polling GET_CUR.
+
+    Root cause of "AI mode SET did not stick" on Linux: the Link 2 AI engine only
+    engages — and only reports a real mode byte — while the camera is streaming.
+    With no active stream the buffer at XU9/0x02 reads back 0xFF ("idle/transition")
+    no matter what we wrote, so the old verify-or-abort loop declared failure and
+    triggered recovery churn that destabilised the camera. The desktop app always
+    holds a stream open when it changes AI mode.
+
+    Sequence (mirrors vrwallace SetCameraMode + an active stream):
+      1. Hold a v4l2 capture stream open.
+      2. Disable any current mode (SET byte[0]=0x00) then SET the target.
+      3. Poll byte[0] until it settles to the target (track settles at 0xFF/0x10).
+
+    When no stream can be started (device busy with another app, no ffmpeg/v4l2-ctl)
+    we trust the SET like the reference Pascal controller rather than abort.
+    """
+    import link_usb_linux as ul
+
+    if mode_name != 'normal':
+        try:
+            if read_privacy():
+                write_privacy(False)
+                time.sleep(0.3)
+        except Exception:
+            pass
+
+    poll_secs = 8.0
+    with ul.video_stream(seconds=poll_secs + 3.0) as streaming:
+        # vrwallace always disables the active mode before setting a new one.
+        if mode_name != 'normal':
+            _apply_ai_mode_buffer(0, 0)
+            time.sleep(0.4)
+        _apply_ai_mode_buffer(mode_id, flag)
+
+        if not streaming:
+            # No stream → byte[0] would read 0xFF regardless; trust the SET.
+            time.sleep(1.0)
+            return
+
+        deadline = time.monotonic() + poll_secs
+        reassert_at = time.monotonic() + 2.5
+        got = None
+        while time.monotonic() < deadline:
+            time.sleep(0.4)
+            got = _ai_mode_byte0()
+            if _ai_mode_wire_ok(mode_name, got):
+                return
+            if time.monotonic() >= reassert_at:
+                _apply_ai_mode_buffer(mode_id, flag)
+                reassert_at = time.monotonic() + 2.5
+        if not _ai_mode_wire_ok(mode_name, got):
+            raise RuntimeError(
+                f'AI mode SET did not stick: wanted {mode_name}, '
+                f'wire byte[0]=0x{got:02x} after {poll_secs:.0f}s with stream held '
+                f'(expected {hex(mode_id) if mode_name != "normal" else "0x00"})')
+
+
 def write_ai_mode(mode_name: str) -> None:
     """Set AI video mode via XU9 sel 0x02.
 
-    OG Link: zero-fill 52-byte buffer. Link 2 (61-byte): zero-fill bytes 0..51,
-    preserve tail 52+, exit to normal and disable privacy before a new mode
-    (matches vrwallace SetCameraMode sequencing).
+    OG Link: zero-fill buffer, write byte[0]/byte[1]. Link 2 (61-byte): hold a
+    video stream open during SET + readback so the AI engine actually engages
+    (see _link2_set_ai_mode_streamed for the root-cause writeup).
 
     Always sends SET (no early return when readback already matches) so Stream
     Deck / hotkey scripts re-trigger the firmware even after a partial apply.
@@ -776,43 +854,18 @@ def write_ai_mode(mode_name: str) -> None:
     ln = _ai_mode_len()
 
     if _link2() and ln >= 61:
-        if mode_name not in ('track', 'normal'):
-            _link2_exit_track_for_mode(mode_name)
-        elif mode_name == 'normal':
-            _link2_try_exit_track()
-        mid = _ai_mode_wire_id()
-        if mode_name != 'normal':
-            if read_privacy():
-                write_privacy(False)
-                time.sleep(0.5)
-            if mid not in (None, 0x00, mode_id):
-                _apply_ai_mode_buffer(0, 0)
-                time.sleep(0.5)
-        _apply_ai_mode_buffer(mode_id, flag)
-    else:
-        buf = bytearray(ln)
-        buf[0] = mode_id
-        buf[1] = flag
-        _uvc_set(9, AI_MODE_SEL, bytes(buf))
+        _link2_set_ai_mode_streamed(mode_name, mode_id, flag)
+        _last_ai_mode_written = mode_name
+        _last_ai_mode_ts = time.monotonic()
+        return
+
+    buf = bytearray(ln)
+    buf[0] = mode_id
+    buf[1] = flag
+    _uvc_set(9, AI_MODE_SEL, bytes(buf))
     _last_ai_mode_written = mode_name
     _last_ai_mode_ts = time.monotonic()
     time.sleep(1.5)  # firmware reports 0xFF during transition (API.md)
-    # Link 2 ioctl SET can appear to succeed while byte[0] does not stick; verify/retry.
-    if _link2() and ln >= 61:
-        retries = 6 if mode_name == 'normal' else 3
-        pause = 1.5 if mode_name == 'normal' else 1.0
-        for attempt in range(retries):
-            if _ai_mode_wire_ok(mode_name, _ai_mode_wire_id()):
-                return
-            if attempt < retries - 1:
-                _apply_ai_mode_buffer(mode_id, flag)
-                time.sleep(pause)
-        got = _ai_mode_wire_id()
-        if not _ai_mode_wire_ok(mode_name, got):
-            raise RuntimeError(
-                f'AI mode SET did not stick: wanted {mode_name}, '
-                f'wire byte[0]=0x{got:02x} (expected '
-                f'{hex(mode_id) if mode_name != "normal" else "0x00"})')
 
 def read_ai_mode() -> str:
     """Read the current video mode."""
