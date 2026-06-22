@@ -47,4 +47,20 @@ jobs:
           git add Formula/link-ctl.rb
           git diff --cached --quiet && echo "Formula unchanged" && exit 0
           git commit -m "homebrew: update formula to ${GITHUB_REF_NAME}"
-          git push origin HEAD:main
+          # The post-commit hook that triggered this release also pushes main,
+          # so the tag-build checkout can be behind origin/main by the time we
+          # push the formula bump. Rebase-and-retry instead of a bare push,
+          # which previously got rejected ("fetch first") and stranded the
+          # formula a version behind PyPI.
+          for attempt in 1 2 3 4 5; do
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort; exit 1; }
+            if git push origin HEAD:main; then
+              echo "Formula pushed on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Push rejected (attempt ${attempt}), retrying after rebase..."
+            sleep 5
+          done
+          echo "::error::Failed to push formula update after 5 attempts"
+          exit 1
