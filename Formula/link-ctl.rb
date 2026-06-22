@@ -7,11 +7,11 @@ class LinkCtl < Formula
   sha256 "8a81de8a634ee9d8837a521ba7ef1a8c3912e901d42bd7ef5376835f033b7001"
   license "MIT"
 
-  # A plain depends_on already makes python@3.11 available at build, runtime,
-  # AND test time. Declaring it a second time as `=> :test` makes Homebrew
-  # treat it as test-only, which then trips `brew test` with
-  # "missing test dependencies: python@3.11" (see CI failure on the PR #13
-  # merge). Keep this as a single runtime dependency.
+  # Single runtime dependency. (Do NOT add a second `=> :test` line: it
+  # doesn't help and is the wrong fix for the "missing test dependencies:
+  # python@3.11" CI failure — that's a known Homebrew API-install-mode bug
+  # where runtime deps get misclassified as test deps, worked around in
+  # ci.yml with HOMEBREW_NO_INSTALL_FROM_API=1. See Homebrew discussion #4150.)
   depends_on "python@3.11"
 
   resource "websockets" do

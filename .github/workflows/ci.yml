@@ -66,6 +66,13 @@ jobs:
   # ── Homebrew formula install (macOS) ────────────────────────────────────────
   brew:
     runs-on: macos-latest
+    # Force traditional (non-API) formula resolution. With API install mode
+    # (the modern default) Homebrew misclassifies link-ctl's runtime python@3.11
+    # dependency as a missing *test* dependency, failing `brew test` with
+    # "missing test dependencies: python@3.11" even though it's installed.
+    # See Homebrew discussion #4150.
+    env:
+      HOMEBREW_NO_INSTALL_FROM_API: 1
     steps:
       - uses: actions/checkout@v4
         with:
