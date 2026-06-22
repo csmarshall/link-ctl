@@ -28,12 +28,12 @@ jobs:
           TAR=$(ls /tmp/sdist/*.tar.gz | head -1)
           echo "sdist contents:"
           tar tzf "$TAR"
-          for f in link_ctl.py link_usb_macos.py; do
+          for f in link_ctl.py link_usb_macos.py link_usb_linux.py; do
             tar tzf "$TAR" | grep -q "/$f$" || { echo "::error::$f missing from sdist"; exit 1; }
           done
 
       - name: Syntax check
-        run: python -m py_compile link_ctl.py tools/validate.py link_usb.py link_usb_macos.py scripts/bump_version.py scripts/update_formula.py
+        run: python -m py_compile link_ctl.py tools/validate.py link_usb.py link_usb_macos.py link_usb_linux.py scripts/bump_version.py scripts/update_formula.py
 
       - name: Import check
         run: python -c "import link_ctl"
