@@ -688,24 +688,6 @@ def _apply_ai_mode_buffer(mode_id: int, flag: int) -> None:
     buf[1] = flag
     _uvc_set(9, AI_MODE_SEL, bytes(buf))
 
-def _ai_mode_wire_id() -> int | None:
-    """Return steady-state byte[0] from the AI mode buffer, or None on read failure."""
-    try:
-        raw = _ai_mode_get_raw()
-    except OSError:
-        return None
-    if not raw:
-        return None
-    mid = raw[0]
-    if mid == 0xFF:
-        time.sleep(0.5)
-        try:
-            raw = _ai_mode_get_raw()
-            mid = raw[0] if raw else 0xFF
-        except OSError:
-            pass
-    return mid
-
 def _ai_mode_wire_ok(mode_name: str, mid: int | None) -> bool:
     """Return True when byte[0] readback matches the requested steady-state mode."""
     if mid is None:
@@ -759,17 +741,6 @@ def _link2_try_exit_track() -> bool:
             pass
     return not _link2_track_stuck()
 
-
-def _link2_exit_track_for_mode(target: str) -> None:
-    """Best-effort exit from AI tracking before another mode SET."""
-    if target == 'track' or not _link2_track_stuck():
-        return
-    if _link2_try_exit_track():
-        return
-    raise RuntimeError(
-        'Link 2 is stuck in AI tracking (0xFF/0x10); USB mode SET has no effect. '
-        'Unplug/replug the camera once. Avoid libusb reset recovery while /dev/video '
-        'exists — it can leave this state.')
 
 def _ai_mode_byte0() -> int | None:
     """Read AI mode buffer byte[0] once (no settle sleep), or None on failure."""
@@ -826,54 +797,74 @@ def _link2_set_ai_mode_streamed(mode_name: str, mode_id: int, flag: int) -> None
             pass
 
     poll_secs = 14.0
-    hold_needed = 3  # consecutive on-target reads (~1.5s) before we trust it
-    with ul.video_stream(seconds=poll_secs + 3.0) as streaming:
-        if not streaming:
-            # No stream → byte[0] reads 0xFF regardless; trust the SET like the
-            # reference controller (zero-fill OFF then target, no readback).
-            if mode_name != 'normal':
-                _apply_ai_mode_buffer(0, 0)
-                time.sleep(0.4)
-            _apply_ai_mode_buffer(mode_id, flag)
-            time.sleep(1.0)
+    with ul.video_stream(seconds=poll_secs + 6.0) as streaming:
+        got = _link2_drive_ai_mode_streaming(
+            mode_name, mode_id, flag, streaming, poll_secs=poll_secs)
+        if not streaming or _ai_mode_wire_ok(mode_name, got):
             return
-
-        # Wait for the AI engine to be ready (byte[0] leaves 0xFF) so the first
-        # SET is not swallowed by pipeline init.
-        ready_deadline = time.monotonic() + 6.0
-        while time.monotonic() < ready_deadline:
-            b0 = _ai_mode_byte0()
-            if b0 is not None and b0 != 0xFF:
-                break
-            time.sleep(0.3)
-
-        # vrwallace disables the active mode before setting a new one; on Link 2
-        # this also moves overhead into its committed 0x05/0x10 state.
-        if mode_name != 'normal':
-            _apply_ai_mode_buffer(0, 0)
-            time.sleep(0.6)
-        _apply_ai_mode_buffer(mode_id, flag)
-
-        deadline = time.monotonic() + poll_secs
-        reassert_at = time.monotonic() + 2.5
-        got = None
-        hold = 0
-        while time.monotonic() < deadline:
-            time.sleep(0.4)
-            got = _ai_mode_byte0()
-            if _ai_mode_wire_ok(mode_name, got):
-                hold += 1
-                if hold >= hold_needed:
-                    return
-            else:
-                hold = 0
-                if time.monotonic() >= reassert_at:
-                    _apply_ai_mode_buffer(mode_id, flag)
-                    reassert_at = time.monotonic() + 2.5
         raise RuntimeError(
             f'AI mode SET did not stick: wanted {mode_name}, '
-            f'wire byte[0]=0x{got:02x} after {poll_secs:.0f}s with stream held '
+            f'wire byte[0]={"0x%02x" % got if got is not None else "None"} after '
+            f'{poll_secs:.0f}s with stream held '
             f'(expected {hex(mode_id) if mode_name != "normal" else "0x00"})')
+
+
+def _link2_drive_ai_mode_streaming(mode_name: str, mode_id: int, flag: int,
+                                   streaming: bool, poll_secs: float = 14.0,
+                                   hold_needed: int = 3) -> int | None:
+    """Drive the Link 2 AI-mode buffer to the target, assuming a v4l2 stream is
+    already held by the caller (the value yielded by link_usb_linux.video_stream).
+
+    Returns the last byte[0] read while streaming (use _ai_mode_wire_ok to judge
+    it), or None when no stream was available to verify against. Never raises —
+    callers decide how to treat a byte[0] that never reached the target. This is
+    the shared in-stream mechanism used by both write_ai_mode (which wraps it in
+    its own stream) and tools/validate.py (which reads byte[0] in the same stream
+    so it sees live modes like overhead before they revert on stream stop).
+    """
+    if not streaming:
+        # No stream → byte[0] reads 0xFF regardless; trust the SET like the
+        # reference controller (zero-fill OFF then target, no readback).
+        if mode_name != 'normal':
+            _apply_ai_mode_buffer(0, 0)
+            time.sleep(0.4)
+        _apply_ai_mode_buffer(mode_id, flag)
+        time.sleep(1.0)
+        return None
+
+    # Wait for the AI engine to be ready (byte[0] leaves 0xFF) so the first
+    # SET is not swallowed by pipeline init.
+    ready_deadline = time.monotonic() + 6.0
+    while time.monotonic() < ready_deadline:
+        b0 = _ai_mode_byte0()
+        if b0 is not None and b0 != 0xFF:
+            break
+        time.sleep(0.3)
+
+    # vrwallace disables the active mode before setting a new one; on Link 2
+    # this also moves overhead into its committed 0x05/0x10 state.
+    if mode_name != 'normal':
+        _apply_ai_mode_buffer(0, 0)
+        time.sleep(0.6)
+    _apply_ai_mode_buffer(mode_id, flag)
+
+    deadline = time.monotonic() + poll_secs
+    reassert_at = time.monotonic() + 2.5
+    got = None
+    hold = 0
+    while time.monotonic() < deadline:
+        time.sleep(0.4)
+        got = _ai_mode_byte0()
+        if _ai_mode_wire_ok(mode_name, got):
+            hold += 1
+            if hold >= hold_needed:
+                return got
+        else:
+            hold = 0
+            if time.monotonic() >= reassert_at:
+                _apply_ai_mode_buffer(mode_id, flag)
+                reassert_at = time.monotonic() + 2.5
+    return got
 
 
 def write_ai_mode(mode_name: str) -> None:

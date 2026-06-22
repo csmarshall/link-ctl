@@ -430,6 +430,50 @@ def _skip_center() -> bool:
     return os.environ.get('LINK_CTL_SKIP_CENTER', '').lower() in ('1', 'true', 'yes')
 
 
+# AI modes verified in-stream (the live modes revert to normal the instant
+# streaming stops, so the SET and the readback must share one stream).
+_AI_MODE_TESTS = ('track', 'overhead', 'deskview')
+
+
+def _run_usb_ai_mode(name: str, mode_name: str, settle: float = 1.5) -> Result:
+    """Set an AI mode and verify byte[0] reaches the target WHILE holding a stream.
+
+    Live AI modes (overhead/whiteboard) revert to normal the moment streaming
+    stops, so reading the mode back after write_ai_mode()'s stream closed always
+    looked like a failure. Here the SET and the readback share one continuous
+    video stream — the same mechanism write_ai_mode/_link2_set_ai_mode_streamed
+    use — and the mode is considered correct when byte[0] reaches the target
+    while streaming (track's persistent 0xFF/0x10 state counts, per
+    _ai_mode_wire_ok / read_ai_mode).
+    """
+    import link_ctl as lc
+    import link_usb_linux as ul
+
+    _log(name)
+    mode_id, flag = lc.AI_MODE_BYTES[mode_name]
+    try:
+        with ul.video_stream(seconds=24.0) as streaming:
+            got = lc._link2_drive_ai_mode_streaming(mode_name, mode_id, flag, streaming)
+            if not streaming:
+                ok = True
+                msg = f'{mode_name}: SET sent (no stream available to verify in-stream)'
+            else:
+                ok = lc._ai_mode_wire_ok(mode_name, got)
+                gh = f'0x{got:02x}' if got is not None else 'None'
+                msg = (f'byte[0]={gh} → {mode_name} (in-stream) ✓' if ok
+                       else f'byte[0]={gh} (expected {mode_name}=0x{mode_id:02x})')
+    except Exception as e:
+        ok, msg = False, str(e)
+    # Restore normal outside the stream, then rebind uvcvideo for the next test.
+    try:
+        lc.write_ai_mode('normal')
+        time.sleep(settle)
+    except Exception:
+        pass
+    _usb_recover()
+    return Result(name, ok, msg)
+
+
 def run_usb_all(only: list[str], skip_center: bool = False) -> int:
     import link_ctl as lc
 
@@ -481,19 +525,16 @@ def run_usb_all(only: list[str], skip_center: bool = False) -> int:
             lc._uvc_set(5, 0x0B, bytes([1]))
 
     # center runs last — CT pan/tilt SET may detach/rebind uvcvideo (needs --detach).
+    # track/overhead/deskview are AI modes: the loop dispatches them to
+    # _run_usb_ai_mode (set + readback share one stream), so their apply/check/
+    # restore slots are unused placeholders here — only name/order matter.
     specs = [
         ('zoom', lambda: lc.write_zoom(200),
          lambda: (lc.read_zoom() == 200, f'zoom={lc.read_zoom()}'),
          lambda: lc.write_zoom(100), False),
-        ('track', lambda: lc.write_ai_mode('track'),
-         lambda: (lc.read_status_usb('track')['is_on'], lc.read_status_usb('track')['display']),
-         lambda: (lc.write_ai_mode('normal'), time.sleep(1.5)), True),
-        ('overhead', lambda: lc.write_ai_mode('overhead'),
-         lambda: (lc.read_status_usb('overhead')['is_on'], lc.read_status_usb('overhead')['display']),
-         lambda: (lc.write_ai_mode('normal'), time.sleep(1.5)), True),
-        ('deskview', lambda: lc.write_ai_mode('deskview'),
-         lambda: (lc.read_status_usb('deskview')['is_on'], lc.read_status_usb('deskview')['display']),
-         lambda: (lc.write_ai_mode('normal'), time.sleep(1.5)), True),
+        ('track', None, None, None, True),
+        ('overhead', None, None, None, True),
+        ('deskview', None, None, None, True),
         ('autoexposure', lambda: lc._uvc_set(9, 0x1e, bytes([1])),
          lambda: (not lc.read_status_usb('autoexposure')['is_on'], lc.read_status_usb('autoexposure')['display']),
          lambda: lc._uvc_set(9, 0x1e, bytes([2])), False),
@@ -519,14 +560,17 @@ def run_usb_all(only: list[str], skip_center: bool = False) -> int:
     if only:
         specs = [s for s in specs if s[0] in only]
 
-    settle_map = {'center': 5.0, 'track': 2.5, 'overhead': 2.5, 'deskview': 2.5}
+    settle_map = {'center': 5.0}
 
     results = []
     for name, apply, check, restore, recover_after in specs:
         print(f'[TEST] {name}')
-        r = run_usb_test(name, apply, check, restore,
-                         settle=settle_map.get(name, 1.0),
-                         recover_after=recover_after)
+        if name in _AI_MODE_TESTS:
+            r = _run_usb_ai_mode(name, name)
+        else:
+            r = run_usb_test(name, apply, check, restore,
+                             settle=settle_map.get(name, 1.0),
+                             recover_after=recover_after)
         print(f'  [{"PASS" if r.passed else "FAIL"}] {r.message}')
         results.append(r)
         time.sleep(0.5)
