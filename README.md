@@ -583,7 +583,18 @@ module-level API is stable for v2.x.
 
 ## Stream Deck Setup
 
-The `streamdeck/` directory contains ready-to-use shell scripts.
+The `streamdeck/` directory contains ready-to-use shell scripts for **macOS and
+Linux**. On Linux they talk USB-direct to the camera (no Insta360 desktop app).
+
+See **[`docs/STREAMDECK_LINUX.md`](docs/STREAMDECK_LINUX.md)** for Link 2 setup
+with Elgato Stream Deck or **[OpenDeck](https://github.com/nekename/OpenDeck)** on Linux.
+
+**OpenDeck (one-shot install):**
+
+```bash
+bash streamdeck/opendeck/install.sh
+# restarts OpenDeck and activates profile "Link2"
+```
 
 ### Setup
 
@@ -592,10 +603,10 @@ The `streamdeck/` directory contains ready-to-use shell scripts.
    to run shell scripts.
 2. Point the script path at the file, e.g.:
    ```
-   /Users/you/work/link-ctl/streamdeck/track_on.sh
+   /home/you/Projects/link-ctl/streamdeck/track_on.sh
    ```
-3. All scripts are self-contained — they resolve `link-ctl.py` relative to
-   their own location, so moving the directory keeps them working.
+3. All scripts source `_common.sh` — they resolve `link_ctl.py` relative to
+   the repo and pass `--quiet` by default for clean button feedback.
 
 ### Available Scripts
 
@@ -605,37 +616,59 @@ The `streamdeck/` directory contains ready-to-use shell scripts.
 | `track_on.sh` / `track_off.sh` | Toggle AI tracking |
 | `deskview_on.sh` / `deskview_off.sh` | Toggle DeskView |
 | `whiteboard_on.sh` / `whiteboard_off.sh` | Toggle whiteboard mode |
-| `privacy_on.sh` / `privacy_off.sh` | Enter / exit privacy mode |
+| `overhead_on.sh` / `overhead_off.sh` | Toggle overhead view |
+| `privacy_on.sh` / `privacy_off.sh` | Gimbal-down privacy (**Link 2 / 2 Pro**) |
+| `hdr_on.sh` / `hdr_off.sh` | HDR |
+| `mirror_on.sh` / `mirror_off.sh` | Horizontal flip |
+| `autoexposure_toggle.sh` / `awb_toggle.sh` | Toggle AE / AWB |
 | `zoom_in.sh` | Zoom in +50 (incremental) |
 | `zoom_out.sh` | Zoom out −50 (incremental) |
 | `normal.sh` | Return to standard mode |
 
 ### Performance Tips
 
-- First run after boot may take ~0.5 s while the port is discovered and cached.
-- Subsequent runs use the cached port and complete in well under 1 s.
-- If the Link Controller is restarted, the cache invalidates automatically on
-  the next failed connection and re-discovery happens transparently.
+- First run after plug-in may take ~0.5 s while USB opens.
+- Subsequent runs complete in well under 1 s (no WebSocket, no desktop app).
+- Avoid rapid-fire **center** buttons — PTZ uses a brief kernel detach on Linux.
 
 ---
 
 ## Linux
 
-PTZ commands fall back to `v4l2-ctl` automatically:
+USB-direct control is supported on Linux via `link_usb_linux.py` (hybrid
+`UVCIOC_CTRL_QUERY` for extension units + libusb for CT/PU). Build the probe
+helper and optional udev rule:
 
 ```bash
-sudo apt install v4l-utils
-link-ctl zoom 200      # → v4l2-ctl -d /dev/video0 --set-ctrl zoom_absolute=200
-link-ctl pan-rel 5     # → v4l2-ctl -d /dev/video0 --set-ctrl pan_relative=5
+sudo apt install v4l-utils libusb-1.0-0-dev
+make -C tools uvc-probe-linux
+sudo cp tools/99-insta360-link.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-Override the device with:
 ```bash
-LINK_CTL_V4L2_DEVICE=/dev/video2 link-ctl zoom 150
+link-ctl track on          # AI modes via USB XU (no Link Controller app)
+link-ctl autoexposure off
+link-ctl hdr on
+link-ctl center            # PTZ via libusb CT registers
+link-ctl zoom 200
+link-ctl status hdr
+python3 tools/validate.py --backend usb
 ```
 
-AI modes and image settings exit with code 4 on Linux — they require the
-Link Controller app (macOS/Windows only).
+**Link 2 notes** (`2e1a:4c04`): pan/tilt **readback** uses v4l2 on Linux (XU
+`0x1A` is stale). Stream Deck scripts work USB-direct — see
+[`docs/STREAMDECK_LINUX.md`](docs/STREAMDECK_LINUX.md). Details in
+[`docs/LINK2_LINUX.md`](docs/LINK2_LINUX.md).
+
+Override the V4L2 device node:
+
+```bash
+LINK_CTL_V4L2_DEVICE=/dev/video2 link-ctl status zoom
+```
+
+If CT/PU libusb access fails, install the udev rule above or set
+`LINK_CTL_USB_DETACH=1` (briefly detaches `uvcvideo` during PTZ writes).
 
 ---
 

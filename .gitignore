@@ -7,6 +7,7 @@ dist/
 *.egg
 
 # Dev tool screenshots and captures
+tools/smoke_captures/
 gap-finder-screenshots/
 gap2-screenshots/
 *.txt
@@ -20,6 +21,7 @@ xu_capture_report_*.capture.json
 
 # Compiled binaries (rebuild from source)
 tools/uvc-probe
+tools/uvc-probe-linux
 tools/uvc-probe.unsigned
 tools/usb-suspend
 tools/usb-suspend.unsigned
@@ -34,6 +36,9 @@ mobileui-screenshots/
 
 # Claude memory
 .claude/
+
+# Lock files — project ships via pip/Homebrew; pyproject.toml is the source of truth
+uv.lock
 
 # macOS
 .DS_Store

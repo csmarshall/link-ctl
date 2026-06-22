@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-unset TMOUT
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
-python3 "$DIR/link_ctl.py" center
+source "$(dirname "$0")/_common.sh"
+run_link_ctl center
 exit $?

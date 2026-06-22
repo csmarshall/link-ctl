@@ -390,7 +390,9 @@ def invalidate_port_cache():
 # (pan, tilt) order. We convert on each boundary; logical pan/tilt values
 # in this module are always in the natural (pan, tilt) sense.
 
-UVC_PROBE = Path(__file__).resolve().parent / 'tools' / 'uvc-probe'
+UVC_PROBE = Path(__file__).resolve().parent / 'tools' / (
+    'uvc-probe-linux' if platform.system() == 'Linux' else 'uvc-probe'
+)
 
 # Camera Terminal (unit 1) standard UVC controls
 CT_PANTILT_ABSOLUTE_SEL = 0x0D   # 8-byte: pan int32 LE + tilt int32 LE
@@ -409,6 +411,8 @@ _usb_backend = None
 try:
     if platform.system() == 'Darwin':
         import link_usb_macos as _usb_backend   # type: ignore
+    elif platform.system() == 'Linux':
+        import link_usb_linux as _usb_backend   # type: ignore
 except Exception:
     _usb_backend = None
 
@@ -423,12 +427,16 @@ def _uvc_probe_available() -> bool:
             pass
     return UVC_PROBE.is_file() and os.access(UVC_PROBE, os.X_OK)
 
+def _linux_usb_status_available() -> bool:
+    return platform.system() == 'Linux' and _uvc_probe_available()
+
 def _uvc_get(unit: int, sel: int, length: int) -> bytes:
     if _usb_backend is not None:
         try:
             return _usb_backend.get(unit, sel, length)
         except Exception:
-            pass
+            if unit in (9, 10, 11) or platform.system() == 'Linux':
+                raise
     r = subprocess.run(
         [str(UVC_PROBE), 'get', str(unit), f'0x{sel:02x}', str(length)],
         capture_output=True, text=True, timeout=3)
@@ -441,7 +449,8 @@ def _uvc_set(unit: int, sel: int, data: bytes) -> None:
         try:
             _usb_backend.set(unit, sel, data); return
         except Exception:
-            pass
+            if unit in (9, 10, 11) or platform.system() == 'Linux':
+                raise
     r = subprocess.run(
         [str(UVC_PROBE), 'set', str(unit), f'0x{sel:02x}', data.hex()],
         capture_output=True, text=True, timeout=3)
@@ -449,8 +458,16 @@ def _uvc_set(unit: int, sel: int, data: bytes) -> None:
         raise RuntimeError(f'uvc-probe set u={unit} s=0x{sel:02x} failed: {r.stderr.strip()}')
 
 def read_pantilt() -> tuple[int, int]:
-    """Return current (pan, tilt). Reads XU1 sel 0x1a which returns the pair
-    in reversed (tilt, pan) order — we swap so callers always see (pan, tilt)."""
+    """Return current (pan, tilt).
+
+    Linux Link 2: v4l2 readback is reliable; XU1 sel 0x1a tilt word is stale.
+    macOS / fallback: XU readback (tilt, pan) LE, swapped to (pan, tilt).
+    """
+    if platform.system() == 'Linux' and _usb_backend is not None:
+        try:
+            return _usb_backend.read_pantilt_v4l2()
+        except Exception:
+            pass
     raw = _uvc_get(XU_PANTILT_READ_UNIT, XU_PANTILT_READ_SEL, 8)
     t, p = struct.unpack('<ii', raw)
     return p, t
@@ -560,16 +577,24 @@ def _bitmask_get() -> int:
 
 def _bitmask_set_bit(bit: int, on: bool) -> None:
     val = _bitmask_get()
+    if bool(val & (1 << bit)) == on:
+        return
     val = val | (1 << bit) if on else val & ~(1 << bit)
-    _uvc_set(BITMASK_UNIT, BITMASK_SEL, val.to_bytes(2, 'little'))
+    wire = val.to_bytes(2, 'little')
+    _uvc_set(BITMASK_UNIT, BITMASK_SEL, wire)
+    # Link 2 ioctl SET can appear to succeed while the bit does not stick; verify/retry.
+    for _ in range(2):
+        if bool(_bitmask_get() & (1 << bit)) == on:
+            return
+        _uvc_set(BITMASK_UNIT, BITMASK_SEL, wire)
 
 def _bitmask_get_bit(bit: int) -> bool:
     return bool(_bitmask_get() & (1 << bit))
 
-# AI video-mode buffer at unit 9 sel 0x02 — 52 bytes, byte[0]=mode_id,
-# byte[1]=mode_flag, rest zero. vrwallace's map:
+# AI video-mode buffer at unit 9 sel 0x02 — byte[0]=mode_id, byte[1]=mode_flag,
+# rest zero. Link 2 reports GET_LEN=61; OG Link uses 52.
 AI_MODE_SEL   = 0x02
-AI_MODE_LEN   = 52
+AI_MODE_LEN   = 52   # default for OG Link; use _ai_mode_len() at runtime
 AI_MODE_BYTES = {
     'normal':     (0x00, 0x00),
     'track':      (0x01, 0x00),
@@ -578,28 +603,415 @@ AI_MODE_BYTES = {
     'deskview':   (0x06, 0x10),
 }
 
-def write_ai_mode(mode_name: str) -> None:
-    mode_id, flag = AI_MODE_BYTES[mode_name]
-    buf = bytearray(AI_MODE_LEN)
+_ai_mode_len_cache: int | None = None
+_privacy_len_cache: int | None = None
+_last_ai_mode_written: str | None = None
+_last_ai_mode_ts: float = 0.0
+
+def reset_usb_caches() -> None:
+    """Clear runtime USB probe caches (call after driver rebind)."""
+    global _ai_mode_len_cache, _privacy_len_cache, _last_ai_mode_written, _last_ai_mode_ts
+    _ai_mode_len_cache = None
+    _privacy_len_cache = None
+    _last_ai_mode_written = None
+    _last_ai_mode_ts = 0.0
+
+def _ai_mode_len() -> int:
+    """Return the firmware-reported AI mode buffer length (52 OG, 61 Link 2)."""
+    global _ai_mode_len_cache
+    if _ai_mode_len_cache is not None:
+        return _ai_mode_len_cache
+    if platform.system() == 'Linux' and _usb_backend is not None:
+        try:
+            ln = _usb_backend.xu_get_len(9, AI_MODE_SEL)
+            if ln > 0:
+                _ai_mode_len_cache = ln
+                return ln
+        except Exception:
+            pass
+    try:
+        from link_usb import LinuxXUBackend
+        b = LinuxXUBackend(); b.open()
+        ln = b.xu_get_len(9, AI_MODE_SEL)
+        b.close()
+        if ln > 0:
+            _ai_mode_len_cache = ln
+            return ln
+    except Exception:
+        pass
+    _ai_mode_len_cache = AI_MODE_LEN
+    return AI_MODE_LEN
+
+def _link2() -> bool:
+    """True when the open USB device is Link 2 / 2 Pro (not OG Link)."""
+    if platform.system() != 'Linux' or _usb_backend is None:
+        return False
+    try:
+        return _usb_backend.is_link2()
+    except Exception:
+        return False
+
+def _ai_mode_get_raw() -> bytes:
+    """Read the AI mode buffer using the firmware-reported length."""
+    ln = _ai_mode_len()
+    try:
+        return _uvc_get(9, AI_MODE_SEL, ln)
+    except OSError:
+        for fallback in (61, 52):
+            if fallback == ln:
+                continue
+            try:
+                return _uvc_get(9, AI_MODE_SEL, fallback)
+            except OSError:
+                continue
+        raise
+
+def _apply_ai_mode_buffer(mode_id: int, flag: int) -> None:
+    """Write byte[0]/byte[1] of the AI mode buffer (XU9 sel 0x02).
+
+    Link 2: zero-fill bytes 0..51 (vrwallace XU_SetMode) but preserve calibration
+    tail at offset 52+. Full-buffer RMW leaves stale byte[1] (often 0x10) in the
+    SET payload and breaks overhead/deskview; wiping the whole 61 bytes breaks SET.
+    """
+    ln = _ai_mode_len()
+    if _link2() and ln >= 61:
+        buf = bytearray(ln)
+        try:
+            cur = _ai_mode_get_raw()
+            if len(cur) >= 61:
+                buf[52:] = cur[52:]
+        except OSError:
+            pass
+    else:
+        buf = bytearray(ln)
     buf[0] = mode_id
     buf[1] = flag
     _uvc_set(9, AI_MODE_SEL, bytes(buf))
 
-def read_ai_mode() -> str:
-    """Read the current video mode. The firmware's GET_LEN reports 1 for
-    this selector even though SET_CUR accepts the full 52-byte AI buffer;
-    we try the short form first, then fall back to the long one."""
-    raw = None
-    for length in (1, 2, 52):
+def _ai_mode_wire_ok(mode_name: str, mid: int | None) -> bool:
+    """Return True when byte[0] readback matches the requested steady-state mode."""
+    if mid is None:
+        return False
+    mode_id, _ = AI_MODE_BYTES[mode_name]
+    if mode_name == 'normal':
+        return mid == 0x00
+    if mode_name == 'track':
+        return mid in (0x01, 0xFF)
+    return mid == mode_id
+
+def _link2_track_stuck() -> bool:
+    """True when Link 2 reports steady AI tracking (0xFF/0x10) on GET."""
+    if not _link2():
+        return False
+    try:
+        raw = _ai_mode_get_raw()
+    except OSError:
+        return False
+    return len(raw) >= 2 and raw[0] == 0xFF and raw[1] == 0x10
+
+def _link2_try_exit_track() -> bool:
+    """Return True when 0xFF/0x10 cleared or AI mode SET is responsive again."""
+    if not _link2_track_stuck():
+        return True
+    # Hold a stream open so the AI engine actually processes the OFF write.
+    try:
+        import link_usb_linux as ul
+        with ul.video_stream(seconds=8.0) as streaming:
+            for _ in range(4):
+                _apply_ai_mode_buffer(0, 0)
+                time.sleep(1.0 if streaming else 2.0)
+                if not _link2_track_stuck():
+                    return True
+    except Exception:
+        for _ in range(4):
+            _apply_ai_mode_buffer(0, 0)
+            time.sleep(2.0)
+            if not _link2_track_stuck():
+                return True
+    if _usb_backend is not None:
         try:
-            raw = _uvc_get(9, AI_MODE_SEL, length); break
-        except Exception: continue
+            import link_usb_linux as ul
+            if ul.recover_ai_mode_stuck():
+                for _ in range(4):
+                    _apply_ai_mode_buffer(0, 0)
+                    time.sleep(2.0)
+                    if not _link2_track_stuck():
+                        return True
+        except Exception:
+            pass
+    return not _link2_track_stuck()
+
+
+def _ai_mode_byte0() -> int | None:
+    """Read AI mode buffer byte[0] once (no settle sleep), or None on failure."""
+    try:
+        raw = _ai_mode_get_raw()
+    except OSError:
+        return None
+    return raw[0] if raw else None
+
+
+def _link2_set_ai_mode_streamed(mode_name: str, mode_id: int, flag: int) -> None:
+    """Set Link 2 AI mode while holding a video stream open, polling GET_CUR.
+
+    Root cause of "AI mode SET did not stick" on Linux: the Link 2 AI engine only
+    engages — and only reports a real mode byte — while the camera is streaming.
+    With no active stream the buffer at XU9/0x02 reads back 0xFF ("idle/transition")
+    no matter what we wrote, so the old verify-or-abort loop declared failure and
+    triggered recovery churn that destabilised the camera. The desktop app always
+    holds a stream open when it changes AI mode.
+
+    Hardware-verified sequence (Link 2, branch feature/linux-usb-link2):
+      1. Hold a v4l2 capture stream open.
+      2. Wait for the AI engine to come up: GET byte[0] flips to 0xFF while the
+         pipeline initialises, then reports the current mode. A SET issued during
+         that 0xFF window is *swallowed* and the engine falls back to NORMAL — so
+         we wait for byte[0] != 0xFF before the first SET.
+      3. Disable the active mode (SET byte[0]=0x00), then SET the target. The
+         firmware often reverts the first one or two SETs (byte[0] shows the
+         target for ~1s then drops back to 0x00), so re-assert the target every
+         ~2.5s until byte[0] *holds* the target for several consecutive reads
+         (~1.5s). Once it catches, it stays put for the life of the stream.
+
+    byte[1] on GET is NOT the flag we send: overhead settles to 0x05/0x10,
+    deskview to 0x06/0x11 regardless of the flag byte. Only byte[0] is checked.
+
+    PERSISTENCE (verified on hardware): deskview survives a stream stop/restart
+    (firmware stores it). Overhead/whiteboard are *live* modes — they hold only
+    while a stream is open and revert to NORMAL once every stream stops, because
+    the AI engine never acquires the persistent lock bit without a valid subject.
+    In normal use the consuming app (Discord/OBS) keeps a stream open, so the
+    mode stays engaged; a no-stream gap is what drops overhead back to normal.
+
+    When no stream can be started (device busy with another app, no ffmpeg/v4l2-ctl)
+    we trust the SET like the reference Pascal controller rather than abort.
+    """
+    import link_usb_linux as ul
+
+    if mode_name != 'normal':
+        try:
+            if read_privacy():
+                write_privacy(False)
+                time.sleep(0.3)
+        except Exception:
+            pass
+
+    poll_secs = 14.0
+    with ul.video_stream(seconds=poll_secs + 6.0) as streaming:
+        got = _link2_drive_ai_mode_streaming(
+            mode_name, mode_id, flag, streaming, poll_secs=poll_secs)
+        if not streaming or _ai_mode_wire_ok(mode_name, got):
+            return
+        raise RuntimeError(
+            f'AI mode SET did not stick: wanted {mode_name}, '
+            f'wire byte[0]={"0x%02x" % got if got is not None else "None"} after '
+            f'{poll_secs:.0f}s with stream held '
+            f'(expected {hex(mode_id) if mode_name != "normal" else "0x00"})')
+
+
+def _link2_drive_ai_mode_streaming(mode_name: str, mode_id: int, flag: int,
+                                   streaming: bool, poll_secs: float = 14.0,
+                                   hold_needed: int = 3) -> int | None:
+    """Drive the Link 2 AI-mode buffer to the target, assuming a v4l2 stream is
+    already held by the caller (the value yielded by link_usb_linux.video_stream).
+
+    Returns the last byte[0] read while streaming (use _ai_mode_wire_ok to judge
+    it), or None when no stream was available to verify against. Never raises —
+    callers decide how to treat a byte[0] that never reached the target. This is
+    the shared in-stream mechanism used by both write_ai_mode (which wraps it in
+    its own stream) and tools/validate.py (which reads byte[0] in the same stream
+    so it sees live modes like overhead before they revert on stream stop).
+    """
+    if not streaming:
+        # No stream → byte[0] reads 0xFF regardless; trust the SET like the
+        # reference controller (zero-fill OFF then target, no readback).
+        if mode_name != 'normal':
+            _apply_ai_mode_buffer(0, 0)
+            time.sleep(0.4)
+        _apply_ai_mode_buffer(mode_id, flag)
+        time.sleep(1.0)
+        return None
+
+    # Wait for the AI engine to be ready (byte[0] leaves 0xFF) so the first
+    # SET is not swallowed by pipeline init.
+    ready_deadline = time.monotonic() + 6.0
+    while time.monotonic() < ready_deadline:
+        b0 = _ai_mode_byte0()
+        if b0 is not None and b0 != 0xFF:
+            break
+        time.sleep(0.3)
+
+    # vrwallace disables the active mode before setting a new one; on Link 2
+    # this also moves overhead into its committed 0x05/0x10 state.
+    if mode_name != 'normal':
+        _apply_ai_mode_buffer(0, 0)
+        time.sleep(0.6)
+    _apply_ai_mode_buffer(mode_id, flag)
+
+    deadline = time.monotonic() + poll_secs
+    reassert_at = time.monotonic() + 2.5
+    got = None
+    hold = 0
+    while time.monotonic() < deadline:
+        time.sleep(0.4)
+        got = _ai_mode_byte0()
+        if _ai_mode_wire_ok(mode_name, got):
+            hold += 1
+            if hold >= hold_needed:
+                return got
+        else:
+            hold = 0
+            if time.monotonic() >= reassert_at:
+                _apply_ai_mode_buffer(mode_id, flag)
+                reassert_at = time.monotonic() + 2.5
+    return got
+
+
+def write_ai_mode(mode_name: str) -> None:
+    """Set AI video mode via XU9 sel 0x02.
+
+    OG Link: zero-fill buffer, write byte[0]/byte[1]. Link 2 (61-byte): hold a
+    video stream open during SET + readback so the AI engine actually engages
+    (see _link2_set_ai_mode_streamed for the root-cause writeup).
+
+    Always sends SET (no early return when readback already matches) so Stream
+    Deck / hotkey scripts re-trigger the firmware even after a partial apply.
+    """
+    global _last_ai_mode_written, _last_ai_mode_ts
+    mode_id, flag = AI_MODE_BYTES[mode_name]
+    ln = _ai_mode_len()
+
+    if _link2() and ln >= 61:
+        _link2_set_ai_mode_streamed(mode_name, mode_id, flag)
+        _last_ai_mode_written = mode_name
+        _last_ai_mode_ts = time.monotonic()
+        return
+
+    buf = bytearray(ln)
+    buf[0] = mode_id
+    buf[1] = flag
+    _uvc_set(9, AI_MODE_SEL, bytes(buf))
+    _last_ai_mode_written = mode_name
+    _last_ai_mode_ts = time.monotonic()
+    time.sleep(1.5)  # firmware reports 0xFF during transition (API.md)
+
+def read_ai_mode() -> str:
+    """Read the current video mode."""
+    raw = None
+    try:
+        raw = _ai_mode_get_raw()
+    except OSError:
+        return 'unknown'
     if not raw: return 'unknown'
     mid = raw[0]; flag = raw[1] if len(raw) > 1 else 0
+    if mid == 0xFF:
+        time.sleep(0.5)
+        try:
+            raw = _ai_mode_get_raw()
+            mid = raw[0]; flag = raw[1] if len(raw) > 1 else 0
+        except Exception:
+            pass
     for name, (m, f) in AI_MODE_BYTES.items():
         if m == mid and (len(raw) < 2 or f == flag):
             return name
+    # Link 2 (61-byte buffer): byte[0] is authoritative in steady state; byte[1] on
+    # GET is often stale (0x10 lingers after deskview). During 0xFF transitions,
+    # prefer a recent write_ai_mode() target over flag-only guesses.
+    if _ai_mode_len() >= 61:
+        if mid == 0x00:
+            return 'normal'
+        link2_by_mode_id = {0x01: 'track', 0x04: 'whiteboard', 0x05: 'overhead', 0x06: 'deskview'}
+        if mid in link2_by_mode_id:
+            return link2_by_mode_id[mid]
+        if mid == 0xFF:
+            if (_last_ai_mode_written
+                    and (time.monotonic() - _last_ai_mode_ts) < 8.0):
+                return _last_ai_mode_written
+            # Give firmware time to leave 0xFF before flag-only guesses (CLI
+            # status runs in a fresh process so _last_ai_mode_written is usually unset).
+            time.sleep(1.0)
+            try:
+                raw = _ai_mode_get_raw()
+                mid = raw[0]; flag = raw[1] if len(raw) > 1 else 0
+                if mid == 0x00:
+                    return 'normal'
+                if mid in link2_by_mode_id:
+                    return link2_by_mode_id[mid]
+            except Exception:
+                pass
+            if mid == 0x00:
+                return 'normal'
+            if mid in link2_by_mode_id:
+                return link2_by_mode_id[mid]
+            if flag == 0x11:
+                return 'deskview'
+            if flag == 0x00:
+                return 'transition'
+            link2_by_flag = {0x01: 'whiteboard', 0x03: 'overhead'}
+            if flag in link2_by_flag:
+                return link2_by_flag[flag]
+            # Persistent 0xFF/0x10 after settle is AI tracking on Link 2 (deskview
+            # reaches 0x06 within ~1s). Stale byte[1]=0x10 on steady GET otherwise.
+            if flag == 0x10 and mid == 0xFF:
+                return 'track'
+            return 'transition'
     return f'unknown(0x{mid:02x}/0x{flag:02x})'
+
+# Link 2 / 2 Pro privacy (XU2 unit 10). OG Link ignores these writes.
+PRIVACY_UNIT = 10
+PRIVACY_SEL  = 0x0F
+BIT_PRIVACY  = 11
+# Observed Link 2 steady-state GET @ 10/0x0F (len=2): 0x0002 when active.
+PRIVACY_ON_WIRE  = 2
+PRIVACY_OFF_WIRE = 0
+
+def _privacy_len() -> int:
+    global _privacy_len_cache
+    if _privacy_len_cache is not None:
+        return _privacy_len_cache
+    if platform.system() == 'Linux' and _usb_backend is not None:
+        try:
+            ln = _usb_backend.xu_get_len(PRIVACY_UNIT, PRIVACY_SEL)
+            if ln > 0:
+                _privacy_len_cache = ln
+                return ln
+        except Exception:
+            pass
+    _privacy_len_cache = 2
+    return 2
+
+def _link2_privacy_available() -> bool:
+    if platform.system() != 'Linux' or _usb_backend is None:
+        return False
+    try:
+        return _usb_backend.privacy_supported()
+    except Exception:
+        return False
+
+def _privacy_wire(on: bool) -> bytes:
+    val = PRIVACY_ON_WIRE if on else PRIVACY_OFF_WIRE
+    ln = _privacy_len()
+    if ln == 1:
+        return bytes([min(val, 255)])
+    return struct.pack('<H', val)
+
+def read_privacy() -> bool:
+    # Link 2: unit 10/0x0F GET often echoes func-enable (0x03fd) — bit 11 is authoritative.
+    if _link2():
+        return _bitmask_get_bit(BIT_PRIVACY)
+    raw = _uvc_get(PRIVACY_UNIT, PRIVACY_SEL, _privacy_len())
+    if len(raw) >= 2:
+        return struct.unpack('<H', raw[:2])[0] != 0
+    return raw[0] != 0
+
+def write_privacy(on: bool) -> None:
+    # Physical gimbal-down privacy is driven by func-enable bit 11; unit 10/0x0F is secondary.
+    _bitmask_set_bit(BIT_PRIVACY, on)
+    try:
+        _uvc_set(PRIVACY_UNIT, PRIVACY_SEL, _privacy_wire(on))
+    except Exception:
+        if not _link2():
+            raise
 
 # Smart framing (composition style) at unit 9 sel 0x13 (19), 1 byte.
 FRAMING_SEL = 0x13
@@ -667,6 +1079,7 @@ STATUS_OPTIONS: dict[str, dict] = {
     'autofocus':        {'kind': 'bool',    'usb': True,  'ws': False, 'linux': True},
     'smartcomposition': {'kind': 'bool',    'usb': False, 'ws': True,  'linux': False},
     'noise-cancel':     {'kind': 'bool',    'usb': True,  'ws': False, 'linux': False},
+    'privacy':          {'kind': 'bool',    'usb': True,  'ws': False, 'linux': False},
     'smartcomp-frame':  {'kind': 'enum',    'usb': True,  'ws': False, 'linux': False},
     'anti-flicker':     {'kind': 'enum',    'usb': True,  'ws': False, 'linux': True},
     'track-speed':      {'kind': 'scalar',  'usb': True,  'ws': True,  'linux': False},
@@ -724,6 +1137,10 @@ def read_status_usb(option: str) -> dict:
         v = _uvc_get(1, 0x08, 1) == bytes([1]); return _status_result(option, v, is_on=v)
     if option == 'noise-cancel':
         v = _uvc_get(9, NOISE_CANCEL_SEL, 1) == bytes([1]); return _status_result(option, v, is_on=v)
+    if option == 'privacy':
+        if not _link2_privacy_available():
+            raise KeyError('privacy requires Link 2 / 2 Pro USB')
+        v = read_privacy(); return _status_result(option, v, is_on=v)
 
     if option == 'anti-flicker':
         raw = _uvc_get(5, 0x05, 1)[0]
@@ -825,8 +1242,14 @@ def read_status_linux(option: str) -> dict:
         v = int(_get('auto_exposure')) != 1
         return _status_result(option, v, is_on=v)
     if option == 'awb':
-        v = int(_get('white_balance_temperature_auto')) == 1
-        return _status_result(option, v, is_on=v)
+        for ctrl in ('white_balance_automatic', 'white_balance_temperature_auto',
+                     'auto_white_balance'):
+            try:
+                v = int(_get(ctrl)) == 1
+                return _status_result(option, v, is_on=v)
+            except Exception:
+                continue
+        raise RuntimeError('no AWB auto v4l2 control found')
     if option == 'autofocus':
         # Newer kernel name is focus_automatic_continuous; older is focus_auto.
         try:    raw = _get('focus_automatic_continuous')
@@ -966,6 +1389,16 @@ def usb_image_dispatch(args) -> None:
                 target = 'off' if cur else 'on'
             _uvc_set(9, NOISE_CANCEL_SEL, bytes([1 if target == 'on' else 0]))
             _info(f"noise-cancel: {'on' if cur else 'off'} → {target}")
+
+        elif cmd == 'privacy':
+            if not _link2_privacy_available():
+                raise RuntimeError('privacy is only supported on Link 2 / 2 Pro via USB')
+            target = args.state
+            cur = read_privacy()
+            if target in (None, 'toggle'):
+                target = 'off' if cur else 'on'
+            write_privacy(target == 'on')
+            _info(f"privacy: {'on' if cur else 'off'} → {target}")
 
         # ── Manual ISO (u9 sel 0x19, 2B LE uint16; AE-off gated) ─────────────
         elif cmd == 'iso':
@@ -1613,7 +2046,7 @@ def cmd_status_query(args) -> int:
     if option:
         meta = STATUS_OPTIONS[option]
         try:
-            if system == 'Darwin' and meta['usb'] and _uvc_probe_available():
+            if (system in ('Darwin', 'Linux')) and meta['usb'] and _uvc_probe_available():
                 result = read_status_usb(option)
             elif system == 'Linux' and meta['linux']:
                 result = read_status_linux(option)
@@ -1634,7 +2067,7 @@ def cmd_status_query(args) -> int:
     results: dict[str, dict] = {}
     errors:  dict[str, str]  = {}
 
-    if system == 'Darwin' and _uvc_probe_available():
+    if system in ('Darwin', 'Linux') and _uvc_probe_available():
         for opt, m in STATUS_OPTIONS.items():
             if not m['usb']: continue
             try:    results[opt] = read_status_usb(opt)
@@ -2373,6 +2806,7 @@ def build_parser() -> argparse.ArgumentParser:
   normal                                return to standard mode
   track-speed  <0-255>                  AI tracking speed (default 2; OG Link semantics TBD)
   noise-cancel [on|off|toggle|status]   microphone noise cancellation (USB-direct only)
+  privacy      [on|off|toggle|status]   gimbal-down privacy (Link 2 / 2 Pro USB only)
 
   ── Image settings  (USB-direct on macOS; WS elsewhere) ────────────
   hdr              [on|off|toggle|status]   HDR
@@ -2411,6 +2845,8 @@ def build_parser() -> argparse.ArgumentParser:
                                   (no option = dump everything readable)
   discover [--verbose]            find WebSocket port and cache it
   preflight                       run all checks (process, USB, port, handshake)
+  reset [--verbose]               recover hung Link after USB detach (Linux)
+  recover                         alias for reset (Linux only)
 
 toggle commands: omit the argument to smart-toggle based on current state.
 status: bool options exit 0 if on / 1 if off; enums and scalars exit 0 and
@@ -2425,6 +2861,8 @@ print the current value to stdout. Equivalent forms:
     p.add_argument('-s', '--silent',  action='store_true', help='Suppress all output including errors')
     p.add_argument('--port',     type=int,                  help='Override WebSocket port discovery')
     p.add_argument('--skip-preflight', action='store_true', help='Skip preflight checks')
+    p.add_argument('--detach', action='store_true',
+                   help='Allow kernel driver detach for PTZ pan/tilt (risky; default is ioctl-only)')
 
     sub = p.add_subparsers(dest='command', required=True)
 
@@ -2483,6 +2921,7 @@ print the current value to stdout. Equivalent forms:
     s = sub.add_parser('wb-temp');       s.add_argument('value', type=int, help='White balance temperature 2800..10000 K (AWB must be off)')
     s = sub.add_parser('track-speed');   s.add_argument('value', type=int, help='AI tracking speed 0..255 (default 2; effective semantics on OG Link TBD)')
     s = sub.add_parser('noise-cancel');  s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
+    s = sub.add_parser('privacy');       s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
     s = sub.add_parser('iso');           s.add_argument('value', type=int, help='Manual ISO 0..65535 (autoexposure must be off)')
     s = sub.add_parser('shutter');       s.add_argument('value', type=int, help='Manual shutter (autoexposure must be off; units appear to be µs — 1000 = 1 ms)')
     s = sub.add_parser('gesture-zoom');  s.add_argument('state', nargs='?', choices=['on', 'off', 'toggle', 'status'])
@@ -2498,6 +2937,17 @@ print the current value to stdout. Equivalent forms:
                    help='emit machine-readable JSON')
     s = sub.add_parser('discover');  s.add_argument('--verbose', action='store_true')
     sub.add_parser('preflight')
+    s = sub.add_parser('reset', help='recover hung Link after USB detach (Linux)')
+    s.add_argument('--verbose', action='store_true',
+                   help='print each recovery step')
+    s.add_argument('--force', action='store_true',
+                   help='recover even when /dev/video* exists (reopen + libusb reset)')
+    s.add_argument('--skip-usb-reset', action='store_true',
+                   help='skip libusb_reset_device (sysfs rebind only)')
+    s = sub.add_parser('recover', help='alias for reset (Linux only)')
+    s.add_argument('--verbose', action='store_true')
+    s.add_argument('--force', action='store_true')
+    s.add_argument('--skip-usb-reset', action='store_true')
 
     return p
 
@@ -2508,6 +2958,13 @@ def main():
     debug  = args.debug
     system = platform.system()
     cmd    = args.command
+
+    # Safe default: never detach uvcvideo unless --detach or LINK_CTL_USB_DETACH=1.
+    if getattr(args, 'detach', False):
+        os.environ['LINK_CTL_USB_DETACH'] = '1'
+        os.environ.pop('LINK_CTL_NO_DETACH', None)
+    elif os.environ.get('LINK_CTL_USB_DETACH', '').lower() not in ('1', 'true', 'yes'):
+        os.environ['LINK_CTL_NO_DETACH'] = '1'
 
     # Set verbosity (silent < quiet < verbose < debug)
     if args.silent:
@@ -2531,6 +2988,28 @@ def main():
         asyncio.run(cmd_preflight_check(debug=debug, port_override=args.port))
         return
 
+    if cmd in ('reset', 'recover'):
+        if system != 'Linux':
+            _warn('✗ reset/recover is only available on Linux.')
+            sys.exit(4)
+        if _usb_backend is None:
+            _warn('✗ link_usb_linux backend unavailable.')
+            sys.exit(4)
+        verbose = getattr(args, 'verbose', False) or _VERBOSITY >= 2
+        try:
+            result = _usb_backend.reset_device(
+                verbose=verbose,
+                skip_usb_reset=getattr(args, 'skip_usb_reset', False),
+                force=getattr(args, 'force', False),
+            )
+        except RuntimeError as e:
+            _warn(f'✗ reset failed: {e}')
+            sys.exit(3)
+        if not args.silent:
+            _info(f"✓ Link recovered — {result['video']} "
+                  f"(methods: {', '.join(result['methods'])})")
+        return
+
     if cmd == 'status':
         sys.exit(cmd_status_query(args))
 
@@ -2543,7 +3022,7 @@ def main():
     if _status_arg == 'status' and cmd in STATUS_OPTIONS:
         meta = STATUS_OPTIONS[cmd]
         try:
-            if system == 'Darwin' and meta['usb'] and _uvc_probe_available():
+            if (system in ('Darwin', 'Linux')) and meta['usb'] and _uvc_probe_available():
                 result = read_status_usb(cmd)
             elif system == 'Linux' and meta['linux']:
                 result = read_status_linux(cmd)
@@ -2585,7 +3064,7 @@ def main():
                     'anti-flicker', 'autofocus',
                     'track', 'deskview', 'whiteboard', 'overhead', 'normal',
                     'smartcomp-frame', 'track-speed',
-                    'noise-cancel', 'iso', 'shutter'}
+                    'noise-cancel', 'privacy', 'iso', 'shutter'}
     if cmd in USB_IMG_CMDS and _uvc_probe_available():
         usb_image_dispatch(args)
         return
@@ -2631,15 +3110,15 @@ def main():
             _warn(f'✗ USB preset {cmd} failed: {e}')
             sys.exit(3)
 
-    # ── Platform-specific AI mode restriction ─────────────────────────────────
+    # ── Platform-specific AI mode restriction (WS-only fallback) ─────────────
     AI_CMDS = {'track', 'deskview', 'whiteboard', 'overhead', 'normal'}
-    if system == 'Linux' and cmd in AI_CMDS:
-        _warn("✗ AI modes require Insta360 Link Controller (macOS/Windows only).")
+    if system == 'Linux' and cmd in AI_CMDS and not _uvc_probe_available():
+        _warn("✗ AI modes require USB-direct backend or Insta360 Link Controller.")
         sys.exit(4)
 
-    # ── Linux PTZ via v4l2-ctl ────────────────────────────────────────────────
+    # ── Linux PTZ via v4l2-ctl (fallback when USB-direct unavailable) ────────
     PTZ_CMDS = {'pan', 'tilt', 'pan-rel', 'tilt-rel', 'zoom', 'zoom-rel', 'center'}
-    if system == 'Linux' and cmd in PTZ_CMDS:
+    if system == 'Linux' and cmd in PTZ_CMDS and not _uvc_probe_available():
         linux_ptz_dispatch(args)
         return
 

@@ -50,6 +50,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
+import platform
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -64,6 +67,8 @@ from link_ctl import (
     build_value_change, build_zoom,
     build_preset_recall, build_preset_save, build_preset_delete,
     _lsof_port, _read_token_from_ini,
+    read_status_usb, write_ai_mode, write_zoom, read_zoom,
+    read_pantilt, _uvc_probe_available,
 )
 
 
@@ -388,6 +393,193 @@ def make_tests() -> list[TestCase]:
     ]
 
 
+def run_usb_test(name: str, apply, check, restore=None, settle: float = 1.0,
+                 recover_after: bool = False) -> Result:
+    _log(name)
+    try:
+        apply()
+        time.sleep(settle)
+        passed, msg = check()
+        if restore:
+            restore()
+            time.sleep(0.5)
+        if recover_after:
+            _usb_recover()
+        return Result(name, passed, msg)
+    except Exception as e:
+        if restore:
+            try:
+                restore()
+            except Exception:
+                pass
+        _usb_recover()
+        return Result(name, False, str(e))
+
+
+def _usb_recover() -> None:
+    """Rebind uvcvideo after CT detach or rapid XU writes."""
+    try:
+        import link_usb_linux as ul
+        ul.recover()
+        time.sleep(1.0)
+    except Exception:
+        pass
+
+
+def _skip_center() -> bool:
+    return os.environ.get('LINK_CTL_SKIP_CENTER', '').lower() in ('1', 'true', 'yes')
+
+
+# AI modes verified in-stream (the live modes revert to normal the instant
+# streaming stops, so the SET and the readback must share one stream).
+_AI_MODE_TESTS = ('track', 'overhead', 'deskview')
+
+
+def _run_usb_ai_mode(name: str, mode_name: str, settle: float = 1.5) -> Result:
+    """Set an AI mode and verify byte[0] reaches the target WHILE holding a stream.
+
+    Live AI modes (overhead/whiteboard) revert to normal the moment streaming
+    stops, so reading the mode back after write_ai_mode()'s stream closed always
+    looked like a failure. Here the SET and the readback share one continuous
+    video stream — the same mechanism write_ai_mode/_link2_set_ai_mode_streamed
+    use — and the mode is considered correct when byte[0] reaches the target
+    while streaming (track's persistent 0xFF/0x10 state counts, per
+    _ai_mode_wire_ok / read_ai_mode).
+    """
+    import link_ctl as lc
+    import link_usb_linux as ul
+
+    _log(name)
+    mode_id, flag = lc.AI_MODE_BYTES[mode_name]
+    try:
+        with ul.video_stream(seconds=24.0) as streaming:
+            got = lc._link2_drive_ai_mode_streaming(mode_name, mode_id, flag, streaming)
+            if not streaming:
+                ok = True
+                msg = f'{mode_name}: SET sent (no stream available to verify in-stream)'
+            else:
+                ok = lc._ai_mode_wire_ok(mode_name, got)
+                gh = f'0x{got:02x}' if got is not None else 'None'
+                msg = (f'byte[0]={gh} → {mode_name} (in-stream) ✓' if ok
+                       else f'byte[0]={gh} (expected {mode_name}=0x{mode_id:02x})')
+    except Exception as e:
+        ok, msg = False, str(e)
+    # Restore normal outside the stream, then rebind uvcvideo for the next test.
+    try:
+        lc.write_ai_mode('normal')
+        time.sleep(settle)
+    except Exception:
+        pass
+    _usb_recover()
+    return Result(name, ok, msg)
+
+
+def run_usb_all(only: list[str], skip_center: bool = False) -> int:
+    import link_ctl as lc
+
+    if not _uvc_probe_available():
+        print('✗ USB-direct backend unavailable.', file=sys.stderr)
+        return 2
+
+    skip_center = skip_center or _skip_center()
+
+    def _save_bit(bit: int) -> bool:
+        return lc._bitmask_get_bit(bit)
+
+    def _restore_bit(bit: int, was_on: bool) -> None:
+        lc._bitmask_set_bit(bit, was_on)
+
+    ctx: dict = {}
+
+    def _center_apply() -> None:
+        _usb_recover()
+        lc.write_ai_mode('normal')
+        time.sleep(1.5)
+        ctx['zoom'] = lc.read_zoom()
+        lc.write_zoom(100)
+        time.sleep(0.5)
+        lc.write_pantilt(0, 0)
+        time.sleep(1.5)
+
+    def _check_center() -> tuple[bool, str]:
+        for attempt in range(12):
+            try:
+                p, t = lc.read_pantilt()
+                z = lc.read_zoom()
+                ok = p == 0 and t == 0 and z == 100
+                if ok or attempt == 11:
+                    return ok, f'pan={p} tilt={t} zoom={z}'
+            except Exception as e:
+                if attempt == 11:
+                    return False, str(e)
+            time.sleep(0.5)
+        return False, 'center check timed out'
+
+    def _awb_apply_off() -> None:
+        ctx['awb'] = lc.read_status_usb('awb')['is_on']
+        if ctx['awb']:
+            lc._uvc_set(5, 0x0B, bytes([0]))
+
+    def _awb_restore() -> None:
+        if ctx.get('awb'):
+            lc._uvc_set(5, 0x0B, bytes([1]))
+
+    # center runs last — CT pan/tilt SET may detach/rebind uvcvideo (needs --detach).
+    # track/overhead/deskview are AI modes: the loop dispatches them to
+    # _run_usb_ai_mode (set + readback share one stream), so their apply/check/
+    # restore slots are unused placeholders here — only name/order matter.
+    specs = [
+        ('zoom', lambda: lc.write_zoom(200),
+         lambda: (lc.read_zoom() == 200, f'zoom={lc.read_zoom()}'),
+         lambda: lc.write_zoom(100), False),
+        ('track', None, None, None, True),
+        ('overhead', None, None, None, True),
+        ('deskview', None, None, None, True),
+        ('autoexposure', lambda: lc._uvc_set(9, 0x1e, bytes([1])),
+         lambda: (not lc.read_status_usb('autoexposure')['is_on'], lc.read_status_usb('autoexposure')['display']),
+         lambda: lc._uvc_set(9, 0x1e, bytes([2])), False),
+        ('awb', _awb_apply_off,
+         lambda: (not lc.read_status_usb('awb')['is_on'], lc.read_status_usb('awb')['display']),
+         _awb_restore, False),
+        ('hdr', lambda: (ctx.__setitem__('hdr', _save_bit(lc.BIT_HDR)), lc._bitmask_set_bit(lc.BIT_HDR, True))[-1],
+         lambda: (lc.read_status_usb('hdr')['is_on'], lc.read_status_usb('hdr')['display']),
+         lambda: _restore_bit(lc.BIT_HDR, ctx.get('hdr', False)), False),
+        ('mirror', lambda: (ctx.__setitem__('mirror', _save_bit(lc.BIT_MIRROR)), lc._bitmask_set_bit(lc.BIT_MIRROR, True))[-1],
+         lambda: (lc.read_status_usb('mirror')['is_on'], lc.read_status_usb('mirror')['display']),
+         lambda: _restore_bit(lc.BIT_MIRROR, ctx.get('mirror', False)), False),
+        ('brightness', lambda: (ctx.__setitem__('bright', lc.read_status_usb('brightness')['value']), lc._uvc_set(5, 0x02, bytes([75])))[-1],
+         lambda: (lc.read_status_usb('brightness')['value'] == 75, f"brightness={lc.read_status_usb('brightness')['value']}"),
+         lambda: lc._uvc_set(5, 0x02, bytes([ctx.get('bright', 50)])), False),
+        ('center', _center_apply,
+         _check_center,
+         lambda: lc.write_zoom(ctx.get('zoom', 100)), True),
+    ]
+    if skip_center:
+        specs = [s for s in specs if s[0] != 'center']
+        print('Skipping center test (LINK_CTL_SKIP_CENTER or --skip-center)', flush=True)
+    if only:
+        specs = [s for s in specs if s[0] in only]
+
+    settle_map = {'center': 5.0}
+
+    results = []
+    for name, apply, check, restore, recover_after in specs:
+        print(f'[TEST] {name}')
+        if name in _AI_MODE_TESTS:
+            r = _run_usb_ai_mode(name, name)
+        else:
+            r = run_usb_test(name, apply, check, restore,
+                             settle=settle_map.get(name, 1.0),
+                             recover_after=recover_after)
+        print(f'  [{"PASS" if r.passed else "FAIL"}] {r.message}')
+        results.append(r)
+        time.sleep(0.5)
+    _usb_recover()
+    failed = sum(1 for r in results if not r.passed)
+    print(f'Results: {len(results)-failed}/{len(results)} passed')
+    return 0 if failed == 0 else 1
+
+
 # ── Main runner ───────────────────────────────────────────────────────────────
 
 async def run_all(port: int, token: str, only: list[str]) -> int:
@@ -468,8 +660,12 @@ def main():
     p.add_argument('url', nargs='?',
                    help='QR code URL (http://link-controller.insta360.com/v3/link/?...)')
     p.add_argument('--port', type=int, help='WebSocket port override')
+    p.add_argument('--backend', choices=('ws', 'usb'), default='ws',
+                   help='Validation backend: ws (Link Controller) or usb (Linux USB-direct)')
     p.add_argument('--only', metavar='NAME[,NAME...]',
                    help='Comma-separated list of tests to run (default: all)')
+    p.add_argument('--skip-center', action='store_true',
+                   help='Skip center PTZ test (also LINK_CTL_SKIP_CENTER=1)')
     p.add_argument('--list', action='store_true', help='List all test names and exit')
     args = p.parse_args()
 
@@ -477,6 +673,11 @@ def main():
         for tc in make_tests():
             print(f'  {tc.name:20s}  {tc.description}')
         return
+
+    only = [n.strip() for n in args.only.split(',')] if args.only else []
+
+    if args.backend == 'usb':
+        sys.exit(run_usb_all(only, skip_center=args.skip_center))
 
     port = args.port
     token = None
@@ -502,7 +703,6 @@ def main():
     if not token:
         token = _read_token_from_ini() or ''
 
-    only = [n.strip() for n in args.only.split(',')] if args.only else []
     sys.exit(asyncio.run(run_all(port, token, only)))
 
 

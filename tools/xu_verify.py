@@ -16,12 +16,16 @@ Usage:
   sudo python3 tools/xu_verify.py --read-only
 """
 import argparse
+import os
+import platform
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-PROBE_BIN = str(Path(__file__).resolve().parent / 'uvc-probe')
+PROBE_BIN = str(Path(__file__).resolve().parent / (
+    'uvc-probe-linux' if platform.system() == 'Linux' else 'uvc-probe'
+))
 
 
 def ts():
@@ -35,10 +39,21 @@ def sep(label):
     print(f'\n[{ts()}] {"─" * 3} {label} {"─" * 40}', flush=True)
 
 
+def _probe_cmd(unit: int, op: str, *args: str) -> list[str]:
+    cmd = [PROBE_BIN]
+    detach = os.environ.get('LINK_CTL_USB_DETACH', '').lower() in ('1', 'true', 'yes')
+    no_detach = os.environ.get('LINK_CTL_NO_DETACH', '').lower() in ('1', 'true', 'yes')
+    if platform.system() == 'Linux' and unit not in (9, 10, 11) and detach and not no_detach:
+        cmd.append('--detach')
+    cmd.append(op)
+    cmd.extend(args)
+    return cmd
+
+
 def xu_get(unit: int, sel: int, length: int) -> bytes:
-    """Read a UVC XU register via uvc-probe get."""
+    """Read a UVC XU register via uvc-probe."""
     result = subprocess.run(
-        [PROBE_BIN, 'get', str(unit), f'0x{sel:02x}', str(length)],
+        _probe_cmd(unit, 'get', str(unit), f'0x{sel:02x}', str(length)),
         capture_output=True, text=True, timeout=5)
     if result.returncode != 0:
         raise RuntimeError(f'GET failed: unit={unit} sel=0x{sel:02x} len={length}: {result.stderr.strip()}')
@@ -46,10 +61,10 @@ def xu_get(unit: int, sel: int, length: int) -> bytes:
 
 
 def xu_set(unit: int, sel: int, data: bytes) -> None:
-    """Write a UVC XU register via uvc-probe set."""
+    """Write a UVC XU register via uvc-probe."""
     hex_str = data.hex()
     result = subprocess.run(
-        [PROBE_BIN, 'set', str(unit), f'0x{sel:02x}', hex_str],
+        _probe_cmd(unit, 'set', str(unit), f'0x{sel:02x}', hex_str),
         capture_output=True, text=True, timeout=5)
     if result.returncode != 0:
         raise RuntimeError(f'SET failed: unit={unit} sel=0x{sel:02x} data={hex_str}: {result.stderr.strip()}')

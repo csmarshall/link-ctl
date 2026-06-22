@@ -35,4 +35,4 @@ link-ctl = "link_ctl:main"
 # back to the WebSocket route at runtime, defeating the whole point of
 # v2.x on macOS. Keep them both listed here so pip installs get a
 # working USB-direct stack out of the box.
-py-modules = ["link_ctl", "link_usb_macos"]
+py-modules = ["link_ctl", "link_usb_macos", "link_usb_linux"]
