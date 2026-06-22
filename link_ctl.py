@@ -790,10 +790,27 @@ def _link2_set_ai_mode_streamed(mode_name: str, mode_id: int, flag: int) -> None
     triggered recovery churn that destabilised the camera. The desktop app always
     holds a stream open when it changes AI mode.
 
-    Sequence (mirrors vrwallace SetCameraMode + an active stream):
+    Hardware-verified sequence (Link 2, branch feature/linux-usb-link2):
       1. Hold a v4l2 capture stream open.
-      2. Disable any current mode (SET byte[0]=0x00) then SET the target.
-      3. Poll byte[0] until it settles to the target (track settles at 0xFF/0x10).
+      2. Wait for the AI engine to come up: GET byte[0] flips to 0xFF while the
+         pipeline initialises, then reports the current mode. A SET issued during
+         that 0xFF window is *swallowed* and the engine falls back to NORMAL — so
+         we wait for byte[0] != 0xFF before the first SET.
+      3. Disable the active mode (SET byte[0]=0x00), then SET the target. The
+         firmware often reverts the first one or two SETs (byte[0] shows the
+         target for ~1s then drops back to 0x00), so re-assert the target every
+         ~2.5s until byte[0] *holds* the target for several consecutive reads
+         (~1.5s). Once it catches, it stays put for the life of the stream.
+
+    byte[1] on GET is NOT the flag we send: overhead settles to 0x05/0x10,
+    deskview to 0x06/0x11 regardless of the flag byte. Only byte[0] is checked.
+
+    PERSISTENCE (verified on hardware): deskview survives a stream stop/restart
+    (firmware stores it). Overhead/whiteboard are *live* modes — they hold only
+    while a stream is open and revert to NORMAL once every stream stops, because
+    the AI engine never acquires the persistent lock bit without a valid subject.
+    In normal use the consuming app (Discord/OBS) keeps a stream open, so the
+    mode stays engaged; a no-stream gap is what drops overhead back to normal.
 
     When no stream can be started (device busy with another app, no ffmpeg/v4l2-ctl)
     we trust the SET like the reference Pascal controller rather than abort.
@@ -808,35 +825,55 @@ def _link2_set_ai_mode_streamed(mode_name: str, mode_id: int, flag: int) -> None
         except Exception:
             pass
 
-    poll_secs = 8.0
+    poll_secs = 14.0
+    hold_needed = 3  # consecutive on-target reads (~1.5s) before we trust it
     with ul.video_stream(seconds=poll_secs + 3.0) as streaming:
-        # vrwallace always disables the active mode before setting a new one.
-        if mode_name != 'normal':
-            _apply_ai_mode_buffer(0, 0)
-            time.sleep(0.4)
-        _apply_ai_mode_buffer(mode_id, flag)
-
         if not streaming:
-            # No stream → byte[0] would read 0xFF regardless; trust the SET.
+            # No stream → byte[0] reads 0xFF regardless; trust the SET like the
+            # reference controller (zero-fill OFF then target, no readback).
+            if mode_name != 'normal':
+                _apply_ai_mode_buffer(0, 0)
+                time.sleep(0.4)
+            _apply_ai_mode_buffer(mode_id, flag)
             time.sleep(1.0)
             return
+
+        # Wait for the AI engine to be ready (byte[0] leaves 0xFF) so the first
+        # SET is not swallowed by pipeline init.
+        ready_deadline = time.monotonic() + 6.0
+        while time.monotonic() < ready_deadline:
+            b0 = _ai_mode_byte0()
+            if b0 is not None and b0 != 0xFF:
+                break
+            time.sleep(0.3)
+
+        # vrwallace disables the active mode before setting a new one; on Link 2
+        # this also moves overhead into its committed 0x05/0x10 state.
+        if mode_name != 'normal':
+            _apply_ai_mode_buffer(0, 0)
+            time.sleep(0.6)
+        _apply_ai_mode_buffer(mode_id, flag)
 
         deadline = time.monotonic() + poll_secs
         reassert_at = time.monotonic() + 2.5
         got = None
+        hold = 0
         while time.monotonic() < deadline:
             time.sleep(0.4)
             got = _ai_mode_byte0()
             if _ai_mode_wire_ok(mode_name, got):
-                return
-            if time.monotonic() >= reassert_at:
-                _apply_ai_mode_buffer(mode_id, flag)
-                reassert_at = time.monotonic() + 2.5
-        if not _ai_mode_wire_ok(mode_name, got):
-            raise RuntimeError(
-                f'AI mode SET did not stick: wanted {mode_name}, '
-                f'wire byte[0]=0x{got:02x} after {poll_secs:.0f}s with stream held '
-                f'(expected {hex(mode_id) if mode_name != "normal" else "0x00"})')
+                hold += 1
+                if hold >= hold_needed:
+                    return
+            else:
+                hold = 0
+                if time.monotonic() >= reassert_at:
+                    _apply_ai_mode_buffer(mode_id, flag)
+                    reassert_at = time.monotonic() + 2.5
+        raise RuntimeError(
+            f'AI mode SET did not stick: wanted {mode_name}, '
+            f'wire byte[0]=0x{got:02x} after {poll_secs:.0f}s with stream held '
+            f'(expected {hex(mode_id) if mode_name != "normal" else "0x00"})')
 
 
 def write_ai_mode(mode_name: str) -> None:

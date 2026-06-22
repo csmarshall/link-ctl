@@ -92,8 +92,17 @@ SET (vrwallace / link-ctl `write_ai_mode`):
 | Off / normal | `0x00` | `0x00` | Link 2: RMW — preserve tail bytes (offset 52+); zero-fill breaks mode SET |
 | Track | `0x01` | `0x00` | |
 | Whiteboard | `0x04` | `0x01` | |
-| Overhead | `0x05` | `0x03` | Exit current mode + disable privacy before SET on Link 2 |
-| DeskView | `0x06` | `0x10` | Active readback: `0x06/0x11` or `0xFF/0x10`; byte[1] `0x10` cleared on normal |
+| Overhead | `0x05` | `0x03` | Active readback: `0x05/0x10` (byte[1] is not the flag we send). **Live mode** — holds while a stream is open, reverts to normal once *all* streams stop |
+| DeskView | `0x06` | `0x10` | Active readback: `0x06/0x11` or `0xFF/0x10`; **persists** across stream stop/restart; byte[1] `0x10` cleared on normal |
+
+**Link 2 AI-mode SET (hardware-verified, branch `feature/linux-usb-link2`):** the
+AI engine only engages/reports a real byte[0] while streaming. SET requires:
+(1) hold a v4l2 stream open, (2) wait for byte[0] to leave `0xFF` (engine ready —
+a SET during init is swallowed → falls back to normal), (3) OFF (`0x00`) then SET
+the target, (4) re-assert the target every ~2.5s until byte[0] *holds* for ~1.5s.
+Only byte[0] is authoritative; the flag byte we write does not change where it
+lands. Overhead reaches `0x05` and holds while streaming; DeskView reaches `0x06`
+and survives a stream restart.
 
 **DeskView off:** `streamdeck/deskview_off.sh` calls `deskview off`, `normal`, then `center`.
 
